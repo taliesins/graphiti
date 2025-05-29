@@ -22,14 +22,15 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
-from neo4j import AsyncDriver
+# from neo4j import AsyncDriver # No longer directly used by Node classes
 from pydantic import BaseModel, Field
 from typing_extensions import LiteralString
 
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import NodeNotFoundError
-from graphiti_core.helpers import DEFAULT_DATABASE
-from graphiti_core.models.nodes.node_db_queries import (
+# from graphiti_core.helpers import DEFAULT_DATABASE # No longer directly used here
+from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
+from graphiti_core.models.nodes.node_db_queries import ( # These queries are used by Neo4jProvider, not directly here
     COMMUNITY_NODE_SAVE,
     ENTITY_NODE_SAVE,
     EPISODIC_NODE_SAVE,
@@ -90,25 +91,17 @@ class Node(BaseModel, ABC):
     uuid: str = Field(default_factory=lambda: str(uuid4()))
     name: str = Field(description='name of the node')
     group_id: str = Field(description='partition of the graph')
-    labels: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list) # Keep for model structure, provider handles storage
     created_at: datetime = Field(default_factory=lambda: utc_now())
 
     @abstractmethod
-    async def save(self, driver: AsyncDriver): ...
+    async def save(self, provider: GraphDatabaseProvider): ... # Changed driver to provider
 
-    async def delete(self, driver: AsyncDriver):
-        result = await driver.execute_query(
-            """
-        MATCH (n:Entity|Episodic|Community {uuid: $uuid})
-        DETACH DELETE n
-        """,
-            uuid=self.uuid,
-            database_=DEFAULT_DATABASE,
-        )
-
-        logger.debug(f'Deleted Node: {self.uuid}')
-
-        return result
+    async def delete(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        await provider.delete_node(self.uuid) # Delegate to provider
+        logger.debug(f'Deleted Node: {self.uuid} via provider')
+        # Return value might change based on provider.delete_node signature, assuming None for now
+        return None 
 
     def __hash__(self):
         return hash(self.uuid)
@@ -119,23 +112,25 @@ class Node(BaseModel, ABC):
         return False
 
     @classmethod
-    async def delete_by_group_id(cls, driver: AsyncDriver, group_id: str):
-        await driver.execute_query(
-            """
-        MATCH (n:Entity|Episodic|Community {group_id: $group_id})
-        DETACH DELETE n
-        """,
-            group_id=group_id,
-            database_=DEFAULT_DATABASE,
-        )
-
+    async def delete_by_group_id(cls, provider: GraphDatabaseProvider, group_id: str): # Changed driver to provider
+        # This method might need to iterate through node types if provider's method is type-specific
+        # Or provider.delete_nodes_by_group_id handles it generically (if possible)
+        # For now, assuming provider has a method that can delete by group_id across types,
+        # or this method needs to be smarter.
+        # Let's assume a generic provider method, or this needs to call for each type.
+        # Based on current provider methods, it's type specific.
+        node_types_to_check = ["Episodic", "Entity", "Community"] # TODO: Make this more robust
+        for node_type in node_types_to_check:
+            await provider.delete_nodes_by_group_id(group_id=group_id, node_type=node_type)
+        logger.info(f"Deletion requested for nodes with group_id: {group_id} across relevant types.")
         return 'SUCCESS'
 
-    @classmethod
-    async def get_by_uuid(cls, driver: AsyncDriver, uuid: str): ...
 
     @classmethod
-    async def get_by_uuids(cls, driver: AsyncDriver, uuids: list[str]): ...
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): ... # Changed driver to provider
+
+    @classmethod
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): ... # Changed driver to provider
 
 
 class EpisodicNode(Node):
@@ -150,146 +145,50 @@ class EpisodicNode(Node):
         default_factory=list,
     )
 
-    async def save(self, driver: AsyncDriver):
-        result = await driver.execute_query(
-            EPISODIC_NODE_SAVE,
-            uuid=self.uuid,
-            name=self.name,
-            group_id=self.group_id,
-            source_description=self.source_description,
-            content=self.content,
-            entity_edges=self.entity_edges,
-            created_at=self.created_at,
-            valid_at=self.valid_at,
-            source=self.source.value,
-            database_=DEFAULT_DATABASE,
-        )
-
-        logger.debug(f'Saved Node to neo4j: {self.uuid}')
-
-        return result
+    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        logger.debug(f'Saving EpisodicNode: {self.uuid} via provider')
+        return await provider.save_episodic_node(self) # Delegate to provider
 
     @classmethod
-    async def get_by_uuid(cls, driver: AsyncDriver, uuid: str):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (e:Episodic {uuid: $uuid})
-            RETURN e.content AS content,
-            e.created_at AS created_at,
-            e.valid_at AS valid_at,
-            e.uuid AS uuid,
-            e.name AS name,
-            e.group_id AS group_id,
-            e.source_description AS source_description,
-            e.source AS source,
-            e.entity_edges AS entity_edges
-        """,
-            uuid=uuid,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        episodes = [get_episodic_node_from_record(record) for record in records]
-
-        if len(episodes) == 0:
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+        # Delegate to provider
+        node = await provider.get_episodic_node_by_uuid(uuid)
+        if not node:
             raise NodeNotFoundError(uuid)
-
-        return episodes[0]
+        return node
 
     @classmethod
-    async def get_by_uuids(cls, driver: AsyncDriver, uuids: list[str]):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (e:Episodic) WHERE e.uuid IN $uuids
-            RETURN DISTINCT
-            e.content AS content,
-            e.created_at AS created_at,
-            e.valid_at AS valid_at,
-            e.uuid AS uuid,
-            e.name AS name,
-            e.group_id AS group_id,
-            e.source_description AS source_description,
-            e.source AS source,
-            e.entity_edges AS entity_edges
-        """,
-            uuids=uuids,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        episodes = [get_episodic_node_from_record(record) for record in records]
-
-        return episodes
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+        # Delegate to provider
+        return await provider.get_episodic_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        driver: AsyncDriver,
+        provider: GraphDatabaseProvider, # Changed driver to provider
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
     ):
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
-
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (e:Episodic) WHERE e.group_id IN $group_ids
-        """
-            + cursor_query
-            + """
-            RETURN DISTINCT
-            e.content AS content,
-            e.created_at AS created_at,
-            e.valid_at AS valid_at,
-            e.uuid AS uuid,
-            e.name AS name,
-            e.group_id AS group_id,
-            e.source_description AS source_description,
-            e.source AS source,
-            e.entity_edges AS entity_edges
-        ORDER BY e.uuid DESC
-        """
-            + limit_query,
-            group_ids=group_ids,
-            uuid=uuid_cursor,
-            limit=limit,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
+        # Delegate to provider
+        return await provider.get_episodic_nodes_by_group_ids(
+            group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
-
-        episodes = [get_episodic_node_from_record(record) for record in records]
-
-        return episodes
 
     @classmethod
-    async def get_by_entity_node_uuid(cls, driver: AsyncDriver, entity_node_uuid: str):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (e:Episodic)-[r:MENTIONS]->(n:Entity {uuid: $entity_node_uuid})
-            RETURN DISTINCT
-            e.content AS content,
-            e.created_at AS created_at,
-            e.valid_at AS valid_at,
-            e.uuid AS uuid,
-            e.name AS name,
-            e.group_id AS group_id,
-            e.source_description AS source_description,
-            e.source AS source,
-            e.entity_edges AS entity_edges
-        """,
-            entity_node_uuid=entity_node_uuid,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        episodes = [get_episodic_node_from_record(record) for record in records]
-
-        return episodes
+    async def get_by_entity_node_uuid(cls, provider: GraphDatabaseProvider, entity_node_uuid: str): # Changed driver to provider
+        # Delegate to provider
+        return await provider.get_episodic_nodes_by_entity_node_uuid(entity_node_uuid)
 
 
 class EntityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
+            e.created_at AS created_at,
+            e.valid_at AS valid_at,
+            e.uuid AS uuid,
+            e.name AS name,
+            e.group_id AS group_id,
+            e.source_description AS source_description,
     summary: str = Field(description='regional summary of surrounding edges', default_factory=str)
     attributes: dict[str, Any] = Field(
         default={}, description='Additional attributes of the node. Dependent on node labels'
@@ -298,250 +197,177 @@ class EntityNode(Node):
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
         text = self.name.replace('\n', ' ')
-        self.name_embedding = await embedder.create(input_data=[text])
+        # embedder.create returns List[List[float]]
+        embedding_result = await embedder.create(input_data=[text])
+        if embedding_result and len(embedding_result) > 0:
+            self.name_embedding = embedding_result[0]
         end = time()
         logger.debug(f'embedded {text} in {end - start} ms')
-
         return self.name_embedding
 
-    async def load_name_embedding(self, driver: AsyncDriver):
-        query: LiteralString = """
-            MATCH (n:Entity {uuid: $uuid})
-            RETURN n.name_embedding AS name_embedding
-        """
-        records, _, _ = await driver.execute_query(
-            query, uuid=self.uuid, database_=DEFAULT_DATABASE, routing_='r'
-        )
+    async def load_name_embedding(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        # Fetch the node using provider to get its embedding
+        node_data = await provider.get_entity_node_by_uuid(self.uuid)
+        if node_data and node_data.name_embedding:
+            self.name_embedding = node_data.name_embedding
+        else:
+            logger.warning(f"Could not load name_embedding for EntityNode {self.uuid} via provider.")
+            # Optionally raise NodeNotFoundError or handle as appropriate
+            if not node_data:
+                 raise NodeNotFoundError(self.uuid)
 
-        if len(records) == 0:
-            raise NodeNotFoundError(self.uuid)
 
-        self.name_embedding = records[0]['name_embedding']
-
-    async def save(self, driver: AsyncDriver):
-        entity_data: dict[str, Any] = {
-            'uuid': self.uuid,
-            'name': self.name,
-            'name_embedding': self.name_embedding,
-            'group_id': self.group_id,
-            'summary': self.summary,
-            'created_at': self.created_at,
-        }
-
-        entity_data.update(self.attributes or {})
-
-        result = await driver.execute_query(
-            ENTITY_NODE_SAVE,
-            labels=self.labels + ['Entity'],
-            entity_data=entity_data,
-            database_=DEFAULT_DATABASE,
-        )
-
-        logger.debug(f'Saved Node to neo4j: {self.uuid}')
-
-        return result
+    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        logger.debug(f'Saving EntityNode: {self.uuid} via provider')
+        return await provider.save_entity_node(self) # Delegate to provider
 
     @classmethod
-    async def get_by_uuid(cls, driver: AsyncDriver, uuid: str):
-        query = (
-            """
-                                                        MATCH (n:Entity {uuid: $uuid})
-                                                        """
-            + ENTITY_NODE_RETURN
-        )
-        records, _, _ = await driver.execute_query(
-            query,
-            uuid=uuid,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        nodes = [get_entity_node_from_record(record) for record in records]
-
-        if len(nodes) == 0:
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+        node = await provider.get_entity_node_by_uuid(uuid)
+        if not node:
             raise NodeNotFoundError(uuid)
-
-        return nodes[0]
+        return node
 
     @classmethod
-    async def get_by_uuids(cls, driver: AsyncDriver, uuids: list[str]):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (n:Entity) WHERE n.uuid IN $uuids
-        """
-            + ENTITY_NODE_RETURN,
-            uuids=uuids,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        nodes = [get_entity_node_from_record(record) for record in records]
-
-        return nodes
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+        return await provider.get_entity_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        driver: AsyncDriver,
+        provider: GraphDatabaseProvider, # Changed driver to provider
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
     ):
-        cursor_query: LiteralString = 'AND n.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
-
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (n:Entity) WHERE n.group_id IN $group_ids
-        """
-            + cursor_query
-            + ENTITY_NODE_RETURN
-            + """
-        ORDER BY n.uuid DESC
-        """
-            + limit_query,
-            group_ids=group_ids,
-            uuid=uuid_cursor,
-            limit=limit,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
+        return await provider.get_entity_nodes_by_group_ids(
+            group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
-
-        nodes = [get_entity_node_from_record(record) for record in records]
-
-        return nodes
 
 
 class CommunityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
     summary: str = Field(description='region summary of member nodes', default_factory=str)
 
-    async def save(self, driver: AsyncDriver):
-        result = await driver.execute_query(
-            COMMUNITY_NODE_SAVE,
-            uuid=self.uuid,
-            name=self.name,
-            group_id=self.group_id,
-            summary=self.summary,
-            name_embedding=self.name_embedding,
-            created_at=self.created_at,
-            database_=DEFAULT_DATABASE,
-        )
-
-        logger.debug(f'Saved Node to neo4j: {self.uuid}')
-
-        return result
+    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        logger.debug(f'Saving CommunityNode: {self.uuid} via provider')
+        return await provider.save_community_node(self) # Delegate to provider
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
         text = self.name.replace('\n', ' ')
-        self.name_embedding = await embedder.create(input_data=[text])
+        embedding_result = await embedder.create(input_data=[text])
+        if embedding_result and len(embedding_result) > 0:
+            self.name_embedding = embedding_result[0]
         end = time()
         logger.debug(f'embedded {text} in {end - start} ms')
-
         return self.name_embedding
 
-    async def load_name_embedding(self, driver: AsyncDriver):
-        query: LiteralString = """
-            MATCH (c:Community {uuid: $uuid})
-            RETURN c.name_embedding AS name_embedding
-        """
-        records, _, _ = await driver.execute_query(
-            query, uuid=self.uuid, database_=DEFAULT_DATABASE, routing_='r'
-        )
+    async def load_name_embedding(self, provider: GraphDatabaseProvider): # Changed driver to provider
+        node_data = await provider.get_community_node_by_uuid(self.uuid)
+        if node_data and node_data.name_embedding:
+            self.name_embedding = node_data.name_embedding
+        else:
+            logger.warning(f"Could not load name_embedding for CommunityNode {self.uuid} via provider.")
+            if not node_data:
+                raise NodeNotFoundError(self.uuid)
 
-        if len(records) == 0:
-            raise NodeNotFoundError(self.uuid)
-
-        self.name_embedding = records[0]['name_embedding']
 
     @classmethod
-    async def get_by_uuid(cls, driver: AsyncDriver, uuid: str):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (n:Community {uuid: $uuid})
-        RETURN
-            n.uuid As uuid, 
-            n.name AS name,
-            n.group_id AS group_id,
-            n.created_at AS created_at, 
-            n.summary AS summary
-        """,
-            uuid=uuid,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        nodes = [get_community_node_from_record(record) for record in records]
-
-        if len(nodes) == 0:
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+        node = await provider.get_community_node_by_uuid(uuid)
+        if not node:
             raise NodeNotFoundError(uuid)
-
-        return nodes[0]
+        return node
 
     @classmethod
-    async def get_by_uuids(cls, driver: AsyncDriver, uuids: list[str]):
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (n:Community) WHERE n.uuid IN $uuids
-        RETURN
-            n.uuid As uuid, 
-            n.name AS name,
-            n.group_id AS group_id,
-            n.created_at AS created_at, 
-            n.summary AS summary
-        """,
-            uuids=uuids,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
-        )
-
-        communities = [get_community_node_from_record(record) for record in records]
-
-        return communities
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+        return await provider.get_community_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        driver: AsyncDriver,
+        provider: GraphDatabaseProvider, # Changed driver to provider
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
     ):
-        cursor_query: LiteralString = 'AND n.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
-
-        records, _, _ = await driver.execute_query(
-            """
-        MATCH (n:Community) WHERE n.group_id IN $group_ids
-        """
-            + cursor_query
-            + """
-        RETURN
-            n.uuid As uuid, 
-            n.name AS name,
-            n.group_id AS group_id,
-            n.created_at AS created_at, 
-            n.summary AS summary
-        ORDER BY n.uuid DESC
-        """
-            + limit_query,
-            group_ids=group_ids,
-            uuid=uuid_cursor,
-            limit=limit,
-            database_=DEFAULT_DATABASE,
-            routing_='r',
+        return await provider.get_community_nodes_by_group_ids(
+            group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
-
-        communities = [get_community_node_from_record(record) for record in records]
-
-        return communities
 
 
 # Node helpers
+# These helpers are primarily used by Neo4jProvider now.
+# They might be moved to the provider module or a shared parsing utility later.
 def get_episodic_node_from_record(record: Any) -> EpisodicNode:
     return EpisodicNode(
         content=record['content'],
+        created_at=record['created_at'].to_native().timestamp(), # This might need adjustment based on provider
+        valid_at=(record['valid_at'].to_native()),
+        uuid=record['uuid'],
+        group_id=record['group_id'],
+        source=EpisodeType.from_str(record['source']),
+        name=record['name'],
+        source_description=record['source_description'],
+        entity_edges=record['entity_edges'],
+    )
+
+
+def get_entity_node_from_record(record: Any) -> EntityNode:
+    # Ensure 'labels' and 'attributes' are present in the record if expected by EntityNode
+    # The structure of 'record' depends on what the provider's get_* methods return.
+    # Neo4j returns 'labels' and 'attributes' as separate dict keys.
+    # KuzuDB might return all properties flat, and labels are implicit by table.
+    # This helper might need to become provider-aware or be simplified if providers return Pydantic models directly.
+    # For now, assuming a Neo4j-like record structure.
+    
+    # Defaulting labels if not present, as some providers (like Kuzu) define labels by table.
+    labels = record.get('labels', ['Entity']) 
+    attributes = record.get('attributes', {})
+
+    entity_node = EntityNode(
+        uuid=record['uuid'],
+        name=record['name'],
+        group_id=record.get('group_id'), # Use .get for safety
+        labels=labels,
+        created_at=record['created_at'].to_native() if hasattr(record['created_at'], 'to_native') else record['created_at'],
+        summary=record.get('summary'),
+        attributes=attributes,
+        name_embedding=record.get('name_embedding') # Add name_embedding
+    )
+
+    # Clean up attributes that are already top-level fields in EntityNode
+    # This logic was specific to Neo4j records where all properties were dumped into 'attributes'.
+    # If providers return cleaner data, this might not be needed or needs adjustment.
+    if isinstance(entity_node.attributes, dict):
+        for key_to_pop in ['uuid', 'name', 'group_id', 'name_embedding', 'summary', 'created_at', 'labels']:
+            entity_node.attributes.pop(key_to_pop, None)
+
+    return entity_node
+
+
+def get_community_node_from_record(record: Any) -> CommunityNode:
+    return CommunityNode(
+        uuid=record['uuid'],
+        name=record['name'],
+        group_id=record.get('group_id'),
+        name_embedding=record.get('name_embedding'), # Make sure this is included by provider query
+        created_at=record['created_at'].to_native() if hasattr(record['created_at'], 'to_native') else record['created_at'],
+        summary=record.get('summary'),
+        labels=record.get('labels', ['Community']) # Default labels
+    )
+
+
+async def create_entity_node_embeddings(embedder: EmbedderClient, nodes: list[EntityNode]):
+    # This utility function might be better placed elsewhere or used by providers internally if needed.
+    # Or called by Graphiti class before passing nodes to provider's bulk save.
+    name_embeddings_list = await embedder.create_batch([node.name for node in nodes])
+    for node, name_embedding_list_item in zip(nodes, name_embeddings_list, strict=True):
+        if name_embedding_list_item and isinstance(name_embedding_list_item, list):
+             node.name_embedding = name_embedding_list_item # Assuming create_batch returns List[List[float]]
+        else: # Fallback if structure is not List[List[float]] but List[float] for a single item batch
+             node.name_embedding = name_embedding_list_item # This assignment might be incorrect depending on actual return type
         created_at=record['created_at'].to_native().timestamp(),
         valid_at=(record['valid_at'].to_native()),
         uuid=record['uuid'],

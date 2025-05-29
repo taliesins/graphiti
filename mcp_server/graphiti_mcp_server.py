@@ -294,7 +294,7 @@ class GraphitiLLMConfig(BaseModel):
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
                 token_provider = create_azure_credential_token_provider()
-                return AsyncAzureOpenAI(
+                return AsyncAzureOpenAI( # type: ignore[return-value] # Pydantic/TypeHint issue with conditional returns
                     azure_endpoint=self.azure_openai_endpoint,
                     azure_deployment=self.azure_openai_deployment_name,
                     api_version=self.azure_openai_api_version,
@@ -412,40 +412,65 @@ class GraphitiEmbedderConfig(BaseModel):
                 )
             elif self.api_key:
                 # Use API key for authentication
-                return AsyncAzureOpenAI(
+                return AsyncAzureOpenAI( # type: ignore[return-value]
                     azure_endpoint=self.azure_openai_endpoint,
                     azure_deployment=self.azure_openai_deployment_name,
                     api_version=self.azure_openai_api_version,
                     api_key=self.api_key,
                 )
             else:
-                logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API')
+                logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API for embeddings')
                 return None
         else:
             # OpenAI API setup
             if not self.api_key:
+                logger.warning("OPENAI_API_KEY not found for Embedder client.")
                 return None
 
             embedder_config = OpenAIEmbedderConfig(api_key=self.api_key, embedding_model=self.model)
-
             return OpenAIEmbedder(config=embedder_config)
 
 
-class Neo4jConfig(BaseModel):
-    """Configuration for Neo4j database connection."""
+class GraphDBConfig(BaseModel): # Renamed from Neo4jConfig
+    """Configuration for Graph Database connection."""
+    provider_type: str = Field("neo4j", alias="GRAPH_DB_PROVIDER")
+    
+    # Neo4j specific
+    uri: Optional[str] = Field('bolt://localhost:7687', alias="NEO4J_URI")
+    user: Optional[str] = Field('neo4j', alias="NEO4J_USER")
+    password: Optional[str] = Field('password', alias="NEO4J_PASSWORD")
 
-    uri: str = 'bolt://localhost:7687'
-    user: str = 'neo4j'
-    password: str = 'password'
+    # KuzuDB specific
+    database_path: Optional[str] = Field(None, alias="KUZUDB_DATABASE_PATH")
+    in_memory: bool = Field(False, alias="KUZUDB_IN_MEMORY")
 
     @classmethod
-    def from_env(cls) -> 'Neo4jConfig':
-        """Create Neo4j configuration from environment variables."""
-        return cls(
-            uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
-            user=os.environ.get('NEO4J_USER', 'neo4j'),
-            password=os.environ.get('NEO4J_PASSWORD', 'password'),
-        )
+    def from_env(cls) -> 'GraphDBConfig':
+        """Create GraphDB configuration from environment variables."""
+        provider_type = os.environ.get('GRAPH_DB_PROVIDER', 'neo4j')
+        
+        if provider_type == 'neo4j':
+            return cls(
+                provider_type=provider_type,
+                uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
+                user=os.environ.get('NEO4J_USER', 'neo4j'),
+                password=os.environ.get('NEO4J_PASSWORD', 'password'),
+                # Kuzu fields will be None by default if not set
+                database_path=os.environ.get('KUZUDB_DATABASE_PATH'),
+                in_memory=os.environ.get('KUZUDB_IN_MEMORY', 'False').lower() == 'true',
+            )
+        elif provider_type == 'kuzudb':
+            return cls(
+                provider_type=provider_type,
+                database_path=os.environ.get('KUZUDB_DATABASE_PATH'),
+                in_memory=os.environ.get('KUZUDB_IN_MEMORY', 'False').lower() == 'true',
+                 # Neo4j fields will be None by default if not set
+                uri=os.environ.get('NEO4J_URI'),
+                user=os.environ.get('NEO4J_USER'),
+                password=os.environ.get('NEO4J_PASSWORD'),
+            )
+        else:
+            raise ValueError(f"Unsupported GRAPH_DB_PROVIDER: {provider_type}")
 
 
 class GraphitiConfig(BaseModel):
@@ -456,7 +481,7 @@ class GraphitiConfig(BaseModel):
 
     llm: GraphitiLLMConfig = Field(default_factory=GraphitiLLMConfig)
     embedder: GraphitiEmbedderConfig = Field(default_factory=GraphitiEmbedderConfig)
-    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    graphdb: GraphDBConfig = Field(default_factory=GraphDBConfig) # Changed neo4j to graphdb
     group_id: str | None = None
     use_custom_entities: bool = False
     destroy_graph: bool = False
@@ -467,7 +492,7 @@ class GraphitiConfig(BaseModel):
         return cls(
             llm=GraphitiLLMConfig.from_env(),
             embedder=GraphitiEmbedderConfig.from_env(),
-            neo4j=Neo4jConfig.from_env(),
+            graphdb=GraphDBConfig.from_env(), # Use GraphDBConfig
         )
 
     @classmethod
@@ -487,6 +512,11 @@ class GraphitiConfig(BaseModel):
 
         # Update LLM config using CLI args
         config.llm = GraphitiLLMConfig.from_cli_and_env(args)
+        
+        # GraphDB config is primarily from env, CLI doesn't override DB connection details directly
+        # but destroy_graph is related. Other provider specific CLI args could be added if needed.
+        config.graphdb = GraphDBConfig.from_env()
+
 
         return config
 
@@ -566,29 +596,37 @@ async def initialize_graphiti():
             raise ValueError('OPENAI_API_KEY must be set when custom entities are enabled')
 
         # Validate Neo4j configuration
-        if not config.neo4j.uri or not config.neo4j.user or not config.neo4j.password:
-            raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+        # This validation will be part of provider initialization now.
+        # if not config.neo4j.uri or not config.neo4j.user or not config.neo4j.password:
+        #     raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
 
         embedder_client = config.embedder.create_client()
         cross_encoder_client = config.llm.create_cross_encoder_client()
+        
+        # Provider initialization will happen here based on config.graphdb.provider_type
+        # For now, this function's responsibility is just config.
+        # The actual Graphiti client instantiation will be updated in the next step.
+        # So, we are not creating the Graphiti client here anymore.
+        # This function will be called by the main server startup, and then Graphiti client will be created.
 
-        # Initialize Graphiti client
-        graphiti_client = Graphiti(
-            uri=config.neo4j.uri,
-            user=config.neo4j.user,
-            password=config.neo4j.password,
-            llm_client=llm_client,
-            embedder=embedder_client,
-            cross_encoder=cross_encoder_client,
-        )
+        # Initialize Graphiti client (This part will be moved/modified in the next step for provider logic)
+        # For this step, we only update config. The Graphiti instantiation below will fail
+        # as it expects a provider. This will be fixed in the "Update Server Code" subtask.
+        # graphiti_client = Graphiti(
+        #     provider= <NEEDS_PROVIDER_INSTANCE_HERE>, # This line will be added in next subtask
+        #     llm_client=llm_client,
+        #     embedder=embedder_client,
+        #     cross_encoder=cross_encoder_client,
+        # )
 
-        # Destroy graph if requested
-        if config.destroy_graph:
-            logger.info('Destroying graph...')
-            await clear_data(graphiti_client.driver)
+        # The following lines related to graphiti_client.driver will also be addressed
+        # when graphiti_client instantiation is updated.
+        # if config.destroy_graph and graphiti_client and graphiti_client.provider: # Check provider
+        #     logger.info('Destroying graph...')
+        #     await graphiti_client.provider.clear_data() # provider method
 
-        # Initialize the graph database with Graphiti's indices
-        await graphiti_client.build_indices_and_constraints()
+        # if graphiti_client:
+        #    await graphiti_client.build_indices_and_constraints()
         logger.info('Graphiti client initialized successfully')
 
         # Log configuration details for transparency

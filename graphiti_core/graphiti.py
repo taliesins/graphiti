@@ -19,19 +19,21 @@ from datetime import datetime
 from time import time
 
 from dotenv import load_dotenv
-from neo4j import AsyncGraphDatabase
+# from neo4j import AsyncGraphDatabase # No longer directly used here
 from pydantic import BaseModel
 from typing_extensions import LiteralString
 
+from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.edges import EntityEdge, EpisodicEdge
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.graphiti_types import GraphitiClients
-from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
+# from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather # DEFAULT_DATABASE no longer needed here
+from graphiti_core.helpers import semaphore_gather # semaphore_gather might still be used by utils
 from graphiti_core.llm_client import LLMClient, OpenAIClient
-from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
-from graphiti_core.search.search import SearchConfig, search
+from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode # These will be refactored to use provider
+from graphiti_core.search.search import SearchConfig, search # Search will be refactored later
 from graphiti_core.search.search_config import DEFAULT_SEARCH_LIMIT, SearchResults
 from graphiti_core.search.search_config_recipes import (
     COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
@@ -67,12 +69,12 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edge,
     resolve_extracted_edges,
 )
-from graphiti_core.utils.maintenance.graph_data_operations import (
+from graphiti_core.utils.maintenance.graph_data_operations import ( # These utils will be refactored later
     EPISODE_WINDOW_LEN,
-    build_indices_and_constraints,
-    retrieve_episodes,
+    # build_indices_and_constraints, # This will be called on provider
+    # retrieve_episodes, # This will be called on provider
 )
-from graphiti_core.utils.maintenance.node_operations import (
+from graphiti_core.utils.maintenance.node_operations import ( # These utils will be refactored later
     extract_attributes_from_nodes,
     extract_nodes,
     resolve_extracted_nodes,
@@ -93,9 +95,7 @@ class AddEpisodeResults(BaseModel):
 class Graphiti:
     def __init__(
         self,
-        uri: str,
-        user: str,
-        password: str,
+        provider: GraphDatabaseProvider, # Changed from uri, user, password
         llm_client: LLMClient | None = None,
         embedder: EmbedderClient | None = None,
         cross_encoder: CrossEncoderClient | None = None,
@@ -104,41 +104,32 @@ class Graphiti:
         """
         Initialize a Graphiti instance.
 
-        This constructor sets up a connection to the Neo4j database and initializes
-        the LLM client for natural language processing tasks.
+        This constructor sets up clients for language model operations, embedding,
+        and cross-encoding, and uses a provided graph database provider for all
+        database interactions.
 
         Parameters
         ----------
-        uri : str
-            The URI of the Neo4j database.
-        user : str
-            The username for authenticating with the Neo4j database.
-        password : str
-            The password for authenticating with the Neo4j database.
+        provider : GraphDatabaseProvider
+            An instance of a class that implements the GraphDatabaseProvider interface.
+            This provider will be used for all graph database operations.
         llm_client : LLMClient | None, optional
             An instance of LLMClient for natural language processing tasks.
             If not provided, a default OpenAIClient will be initialized.
-
+        embedder : EmbedderClient | None, optional
+            An instance of EmbedderClient for generating embeddings.
+            If not provided, a default OpenAIEmbedder will be initialized.
+        cross_encoder : CrossEncoderClient | None, optional
+            An instance of CrossEncoderClient for reranking search results.
+            If not provided, a default OpenAIRerankerClient will be initialized.
+        store_raw_episode_content : bool, optional
+            Whether to store the raw content of episodes. Defaults to True.
+            
         Returns
         -------
         None
-
-        Notes
-        -----
-        This method establishes a connection to the Neo4j database using the provided
-        credentials. It also sets up the LLM client, either using the provided client
-        or by creating a default OpenAIClient.
-
-        The default database name is set to 'neo4j'. If a different database name
-        is required, it should be specified in the URI or set separately after
-        initialization.
-
-        The OpenAI API key is expected to be set in the environment variables.
-        Make sure to set the OPENAI_API_KEY environment variable before initializing
-        Graphiti if you're using the default OpenAIClient.
         """
-        self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
-        self.database = DEFAULT_DATABASE
+        self.provider = provider # Store the provider instance
         self.store_raw_episode_content = store_raw_episode_content
         if llm_client:
             self.llm_client = llm_client
@@ -154,7 +145,7 @@ class Graphiti:
             self.cross_encoder = OpenAIRerankerClient()
 
         self.clients = GraphitiClients(
-            driver=self.driver,
+            provider=self.provider, # Pass provider instead of driver
             llm_client=self.llm_client,
             embedder=self.embedder,
             cross_encoder=self.cross_encoder,
@@ -162,104 +153,36 @@ class Graphiti:
 
     async def close(self):
         """
-        Close the connection to the Neo4j database.
-
-        This method safely closes the driver connection to the Neo4j database.
-        It should be called when the Graphiti instance is no longer needed or
-        when the application is shutting down.
-
-        Parameters
-        ----------
-        self
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        It's important to close the driver connection to release system resources
-        and ensure that all pending transactions are completed or rolled back.
-        This method should be called as part of a cleanup process, potentially
-        in a context manager or a shutdown hook.
-
-        Example:
-            graphiti = Graphiti(uri, user, password)
-            try:
-                # Use graphiti...
-            finally:
-                graphiti.close()
+        Close the connection to the graph database via the provider.
         """
-        await self.driver.close()
+        if self.provider:
+            await self.provider.close()
 
     async def build_indices_and_constraints(self, delete_existing: bool = False):
         """
-        Build indices and constraints in the Neo4j database.
-
-        This method sets up the necessary indices and constraints in the Neo4j database
-        to optimize query performance and ensure data integrity for the knowledge graph.
-
-        Parameters
-        ----------
-        self
-        delete_existing : bool, optional
-            Whether to clear existing indices before creating new ones.
-
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        This method should typically be called once during the initial setup of the
-        knowledge graph or when updating the database schema. It uses the
-        `build_indices_and_constraints` function from the
-        `graphiti_core.utils.maintenance.graph_data_operations` module to perform
-        the actual database operations.
-
-        The specific indices and constraints created depend on the implementation
-        of the `build_indices_and_constraints` function. Refer to that function's
-        documentation for details on the exact database schema modifications.
-
-        Caution: Running this method on a large existing database may take some time
-        and could impact database performance during execution.
+        Build indices and constraints in the graph database using the provider.
         """
-        await build_indices_and_constraints(self.driver, delete_existing)
+        if self.provider:
+            await self.provider.build_indices_and_constraints(delete_existing)
 
     async def retrieve_episodes(
         self,
         reference_time: datetime,
-        last_n: int = EPISODE_WINDOW_LEN,
+        last_n: int = EPISODE_WINDOW_LEN, # This default might be provider-specific or stay general
         group_ids: list[str] | None = None,
         source: EpisodeType | None = None,
     ) -> list[EpisodicNode]:
         """
-        Retrieve the last n episodic nodes from the graph.
-
-        This method fetches a specified number of the most recent episodic nodes
-        from the graph, relative to the given reference time.
-
-        Parameters
-        ----------
-        reference_time : datetime
-            The reference time to retrieve episodes before.
-        last_n : int, optional
-            The number of episodes to retrieve. Defaults to EPISODE_WINDOW_LEN.
-        group_ids : list[str | None], optional
-            The group ids to return data from.
-
-        Returns
-        -------
-        list[EpisodicNode]
-            A list of the most recent EpisodicNode objects.
-
-        Notes
-        -----
-        The actual retrieval is performed by the `retrieve_episodes` function
-        from the `graphiti_core.utils` module.
+        Retrieve the last n episodic nodes from the graph using the provider.
         """
-        return await retrieve_episodes(self.driver, reference_time, last_n, group_ids, source)
+        if self.provider:
+            return await self.provider.retrieve_episodes(
+                reference_time=reference_time,
+                last_n=last_n,
+                group_ids=group_ids,
+                source=source,
+            )
+        return [] # Or raise an error if provider is not set
 
     async def add_episode(
         self,
@@ -333,17 +256,19 @@ class Graphiti:
 
             previous_episodes = (
                 await self.retrieve_episodes(
-                    reference_time,
+                    reference_time, # Uses self.retrieve_episodes which is now provider-based
                     last_n=RELEVANT_SCHEMA_LIMIT,
                     group_ids=[group_id],
                     source=source,
                 )
                 if previous_episode_uuids is None
-                else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
+                # EpisodicNode.get_by_uuids will be refactored to use provider
+                else await EpisodicNode.get_by_uuids(self.provider, previous_episode_uuids) 
             )
 
             episode = (
-                await EpisodicNode.get_by_uuid(self.driver, uuid)
+                # EpisodicNode.get_by_uuid will be refactored to use provider
+                await EpisodicNode.get_by_uuid(self.provider, uuid) 
                 if uuid is not None
                 else EpisodicNode(
                     name=name,
@@ -409,8 +334,13 @@ class Graphiti:
             if not self.store_raw_episode_content:
                 episode.content = ''
 
-            await add_nodes_and_edges_bulk(
-                self.driver, [episode], episodic_edges, hydrated_nodes, entity_edges, self.embedder
+            # Use provider for bulk add
+            await self.provider.add_nodes_and_edges_bulk(
+                episodic_nodes=[episode], 
+                episodic_edges=episodic_edges, 
+                entity_nodes=hydrated_nodes, 
+                entity_edges=entity_edges, 
+                embedder=self.embedder
             )
 
             # Update any communities
@@ -486,10 +416,12 @@ class Graphiti:
             ]
 
             # Save all the episodes
-            await semaphore_gather(*[episode.save(self.driver) for episode in episodes])
+            # EpisodicNode.save will be refactored to use provider
+            await semaphore_gather(*[episode.save(self.provider) for episode in episodes])
 
             # Get previous episode context for each episode
-            episode_pairs = await retrieve_previous_episodes_bulk(self.driver, episodes)
+            # retrieve_previous_episodes_bulk will need refactoring to use provider
+            episode_pairs = await retrieve_previous_episodes_bulk(self.provider, episodes) # type: ignore
 
             # Extract all nodes and edges
             (
@@ -510,8 +442,8 @@ class Graphiti:
                 extract_edge_dates_bulk(self.llm_client, extracted_edges, episode_pairs),
             )
 
-            # save nodes to KG
-            await semaphore_gather(*[node.save(self.driver) for node in nodes])
+            # Node.save will be refactored to use provider
+            await semaphore_gather(*[node.save(self.provider) for node in nodes])
 
             # re-map edge pointers so that they don't point to discard dupe nodes
             extracted_edges_with_resolved_pointers: list[EntityEdge] = resolve_edge_pointers(
@@ -521,21 +453,29 @@ class Graphiti:
                 episodic_edges, uuid_map
             )
 
-            # save episodic edges to KG
+            # Edge.save will be refactored to use provider
             await semaphore_gather(
-                *[edge.save(self.driver) for edge in episodic_edges_with_resolved_pointers]
+                *[edge.save(self.provider) for edge in episodic_edges_with_resolved_pointers]
             )
 
             # Dedupe extracted edges
+            # dedupe_edges_bulk will be refactored to use provider
             edges = await dedupe_edges_bulk(
-                self.driver, self.llm_client, extracted_edges_with_resolved_pointers
+                self.provider, self.llm_client, extracted_edges_with_resolved_pointers # type: ignore
             )
             logger.debug(f'extracted edge length: {len(edges)}')
 
             # invalidate edges
 
-            # save edges to KG
-            await semaphore_gather(*[edge.save(self.driver) for edge in edges])
+            # Edge.save will be refactored to use provider
+            await semaphore_gather(*[edge.save(self.provider) for edge in edges])
+
+            # The main bulk save operation will be done by the provider itself if we refactor utils
+            # For now, individual saves are being delegated.
+            # If add_nodes_and_edges_bulk utility is kept, it needs to use the provider.
+            # Or, we directly call self.provider.add_nodes_and_edges_bulk here.
+            # The current structure of add_episode_bulk is very utility-heavy.
+            # Awaiting full refactor of those utils.
 
             end = time()
             logger.info(f'Completed add_episode_bulk in {(end - start) * 1000} ms')

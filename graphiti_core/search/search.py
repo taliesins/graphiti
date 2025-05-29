@@ -18,7 +18,8 @@ import logging
 from collections import defaultdict
 from time import time
 
-from neo4j import AsyncDriver
+# from neo4j import AsyncDriver # No longer used directly
+from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
 
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.edges import EntityEdge
@@ -76,7 +77,7 @@ async def search(
 ) -> SearchResults:
     start = time()
 
-    driver = clients.driver
+    provider = clients.provider # Use provider from clients
     embedder = clients.embedder
     cross_encoder = clients.cross_encoder
 
@@ -96,8 +97,8 @@ async def search(
     # if group_ids is empty, set it to None
     group_ids = group_ids if group_ids else None
     edges, nodes, episodes, communities = await semaphore_gather(
-        edge_search(
-            driver,
+        edge_search( # Pass provider instead of driver
+            provider,
             cross_encoder,
             query,
             query_vector,
@@ -109,8 +110,8 @@ async def search(
             config.limit,
             config.reranker_min_score,
         ),
-        node_search(
-            driver,
+        node_search( # Pass provider instead of driver
+            provider,
             cross_encoder,
             query,
             query_vector,
@@ -122,8 +123,8 @@ async def search(
             config.limit,
             config.reranker_min_score,
         ),
-        episode_search(
-            driver,
+        episode_search( # Pass provider instead of driver
+            provider,
             cross_encoder,
             query,
             query_vector,
@@ -133,8 +134,8 @@ async def search(
             config.limit,
             config.reranker_min_score,
         ),
-        community_search(
-            driver,
+        community_search( # Pass provider instead of driver
+            provider,
             cross_encoder,
             query,
             query_vector,
@@ -160,7 +161,7 @@ async def search(
 
 
 async def edge_search(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider, # Changed driver to provider
     cross_encoder: CrossEncoderClient,
     query: str,
     query_vector: list[float],
@@ -177,20 +178,20 @@ async def edge_search(
 
     search_results: list[list[EntityEdge]] = list(
         await semaphore_gather(
-            *[
-                edge_fulltext_search(driver, query, search_filter, group_ids, 2 * limit),
-                edge_similarity_search(
-                    driver,
+            *[ # Call provider methods
+                provider.edge_fulltext_search(query, search_filter, group_ids, 2 * limit),
+                provider.edge_similarity_search(
                     query_vector,
-                    None,
-                    None,
+                    None, # source_node_uuid
+                    None, # target_node_uuid
+                    search_filter,
                     search_filter,
                     group_ids,
                     2 * limit,
                     config.sim_min_score,
                 ),
-                edge_bfs_search(
-                    driver, bfs_origin_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
+                provider.edge_bfs_search( # Call provider method
+                    bfs_origin_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
                 ),
             ]
         )
@@ -199,8 +200,8 @@ async def edge_search(
     if EdgeSearchMethod.bfs in config.search_methods and bfs_origin_node_uuids is None:
         source_node_uuids = [edge.source_node_uuid for result in search_results for edge in result]
         search_results.append(
-            await edge_bfs_search(
-                driver, source_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
+            await provider.edge_bfs_search( # Call provider method
+                source_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
             )
         )
 
@@ -209,20 +210,23 @@ async def edge_search(
     reranked_uuids: list[str] = []
     if config.reranker == EdgeReranker.rrf or config.reranker == EdgeReranker.episode_mentions:
         search_result_uuids = [[edge.uuid for edge in result] for result in search_results]
+        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score) # rrf is local
 
-        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score)
     elif config.reranker == EdgeReranker.mmr:
-        search_result_uuids_and_vectors = await get_embeddings_for_edges(
-            driver, list(edge_uuid_map.values())
+        # get_embeddings_for_edges is now a provider method
+        search_result_uuids_and_vectors = await provider.get_embeddings_for_edges(
+            list(edge_uuid_map.values())
         )
-        reranked_uuids = maximal_marginal_relevance(
+        reranked_uuids = maximal_marginal_relevance( # maximal_marginal_relevance is local
             query_vector,
+            search_result_uuids_and_vectors,
             search_result_uuids_and_vectors,
             config.mmr_lambda,
             reranker_min_score,
         )
     elif config.reranker == EdgeReranker.cross_encoder:
-        fact_to_uuid_map = {edge.fact: edge.uuid for edge in list(edge_uuid_map.values())[:limit]}
+        # This part remains the same as cross_encoder is not part of the DB provider
+        fact_to_uuid_map = {edge.fact: edge.uuid for edge in list(edge_uuid_map.values())[:limit]} # Ensure we only take up to limit for CE
         reranked_facts = await cross_encoder.rank(query, list(fact_to_uuid_map.keys()))
         reranked_uuids = [
             fact_to_uuid_map[fact] for fact, score in reranked_facts if score >= reranker_min_score
@@ -231,37 +235,39 @@ async def edge_search(
         if center_node_uuid is None:
             raise SearchRerankerError('No center node provided for Node Distance reranker')
 
-        # use rrf as a preliminary sort
-        sorted_result_uuids = rrf(
+        sorted_result_uuids = rrf( # rrf is local
             [[edge.uuid for edge in result] for result in search_results],
             min_score=reranker_min_score,
         )
         sorted_results = [edge_uuid_map[uuid] for uuid in sorted_result_uuids]
 
-        # node distance reranking
         source_to_edge_uuid_map = defaultdict(list)
         for edge in sorted_results:
             source_to_edge_uuid_map[edge.source_node_uuid].append(edge.uuid)
+        source_uuids = list(source_to_edge_uuid_map.keys())
 
-        source_uuids = [source_node_uuid for source_node_uuid in source_to_edge_uuid_map]
-
+        # node_distance_reranker now takes provider
         reranked_node_uuids = await node_distance_reranker(
-            driver, source_uuids, center_node_uuid, min_score=reranker_min_score
+            provider, source_uuids, center_node_uuid, min_score=reranker_min_score
         )
 
+        reranked_uuids = [] # Reset and fill
         for node_uuid in reranked_node_uuids:
             reranked_uuids.extend(source_to_edge_uuid_map[node_uuid])
+    
+    # Ensure unique edges if different paths led to same edge
+    unique_reranked_uuids = list(dict.fromkeys(reranked_uuids))
+    reranked_edges = [edge_uuid_map[uuid] for uuid in unique_reranked_uuids if uuid in edge_uuid_map]
 
-    reranked_edges = [edge_uuid_map[uuid] for uuid in reranked_uuids]
 
-    if config.reranker == EdgeReranker.episode_mentions:
+    if config.reranker == EdgeReranker.episode_mentions: # This is a final sort, not a selection
         reranked_edges.sort(reverse=True, key=lambda edge: len(edge.episodes))
 
     return reranked_edges[:limit]
 
 
 async def node_search(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider, # Changed driver to provider
     cross_encoder: CrossEncoderClient,
     query: str,
     query_vector: list[float],
@@ -278,13 +284,13 @@ async def node_search(
 
     search_results: list[list[EntityNode]] = list(
         await semaphore_gather(
-            *[
-                node_fulltext_search(driver, query, search_filter, group_ids, 2 * limit),
-                node_similarity_search(
-                    driver, query_vector, search_filter, group_ids, 2 * limit, config.sim_min_score
+            *[ # Call provider methods
+                provider.node_fulltext_search(query, search_filter, group_ids, 2 * limit),
+                provider.node_similarity_search(
+                    query_vector, search_filter, group_ids, 2 * limit, config.sim_min_score
                 ),
-                node_bfs_search(
-                    driver, bfs_origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
+                provider.node_bfs_search( # Call provider method
+                    bfs_origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
                 ),
             ]
         )
@@ -293,8 +299,8 @@ async def node_search(
     if NodeSearchMethod.bfs in config.search_methods and bfs_origin_node_uuids is None:
         origin_node_uuids = [node.uuid for result in search_results for node in result]
         search_results.append(
-            await node_bfs_search(
-                driver, origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
+            await provider.node_bfs_search( # Call provider method
+                origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
             )
         )
 
@@ -303,21 +309,23 @@ async def node_search(
 
     reranked_uuids: list[str] = []
     if config.reranker == NodeReranker.rrf:
-        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score)
-    elif config.reranker == NodeReranker.mmr:
-        search_result_uuids_and_vectors = await get_embeddings_for_nodes(
-            driver, list(node_uuid_map.values())
-        )
+        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score) # rrf is local
 
-        reranked_uuids = maximal_marginal_relevance(
+    elif config.reranker == NodeReranker.mmr:
+        # get_embeddings_for_nodes is now a provider method
+        search_result_uuids_and_vectors = await provider.get_embeddings_for_nodes(
+            list(node_uuid_map.values())
+        )
+        reranked_uuids = maximal_marginal_relevance( # maximal_marginal_relevance is local
             query_vector,
+            search_result_uuids_and_vectors,
             search_result_uuids_and_vectors,
             config.mmr_lambda,
             reranker_min_score,
         )
     elif config.reranker == NodeReranker.cross_encoder:
+        # This part remains the same
         name_to_uuid_map = {node.name: node.uuid for node in list(node_uuid_map.values())}
-
         reranked_node_names = await cross_encoder.rank(query, list(name_to_uuid_map.keys()))
         reranked_uuids = [
             name_to_uuid_map[name]
@@ -325,26 +333,29 @@ async def node_search(
             if score >= reranker_min_score
         ]
     elif config.reranker == NodeReranker.episode_mentions:
+        # episode_mentions_reranker now takes provider
         reranked_uuids = await episode_mentions_reranker(
-            driver, search_result_uuids, min_score=reranker_min_score
+            provider, search_result_uuids, min_score=reranker_min_score
         )
     elif config.reranker == NodeReranker.node_distance:
         if center_node_uuid is None:
             raise SearchRerankerError('No center node provided for Node Distance reranker')
+        # node_distance_reranker now takes provider
         reranked_uuids = await node_distance_reranker(
-            driver,
-            rrf(search_result_uuids, min_score=reranker_min_score),
+            provider,
+            rrf(search_result_uuids, min_score=reranker_min_score), # rrf is local
             center_node_uuid,
             min_score=reranker_min_score,
         )
-
-    reranked_nodes = [node_uuid_map[uuid] for uuid in reranked_uuids]
+    
+    unique_reranked_uuids = list(dict.fromkeys(reranked_uuids))
+    reranked_nodes = [node_uuid_map[uuid] for uuid in unique_reranked_uuids if uuid in node_uuid_map]
 
     return reranked_nodes[:limit]
 
 
 async def episode_search(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider, # Changed driver to provider
     cross_encoder: CrossEncoderClient,
     query: str,
     _query_vector: list[float],
@@ -359,8 +370,8 @@ async def episode_search(
 
     search_results: list[list[EpisodicNode]] = list(
         await semaphore_gather(
-            *[
-                episode_fulltext_search(driver, query, search_filter, group_ids, 2 * limit),
+            *[ # Call provider method
+                provider.episode_fulltext_search(query, search_filter, group_ids, 2 * limit),
             ]
         )
     )
@@ -370,14 +381,13 @@ async def episode_search(
 
     reranked_uuids: list[str] = []
     if config.reranker == EpisodeReranker.rrf:
-        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score)
+        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score) # rrf is local
 
     elif config.reranker == EpisodeReranker.cross_encoder:
-        # use rrf as a preliminary reranker
+        # This part remains the same
         rrf_result_uuids = rrf(search_result_uuids, min_score=reranker_min_score)
         rrf_results = [episode_uuid_map[uuid] for uuid in rrf_result_uuids][:limit]
-
-        content_to_uuid_map = {episode.content: episode.uuid for episode in rrf_results}
+        content_to_uuid_map = {episode.content: episode.uuid for episode in rrf_results if episode.content} # Ensure content is not None
 
         reranked_contents = await cross_encoder.rank(query, list(content_to_uuid_map.keys()))
         reranked_uuids = [
@@ -385,14 +395,16 @@ async def episode_search(
             for content, score in reranked_contents
             if score >= reranker_min_score
         ]
+    
+    unique_reranked_uuids = list(dict.fromkeys(reranked_uuids))
+    reranked_episodes = [episode_uuid_map[uuid] for uuid in unique_reranked_uuids if uuid in episode_uuid_map]
 
-    reranked_episodes = [episode_uuid_map[uuid] for uuid in reranked_uuids]
 
     return reranked_episodes[:limit]
 
 
 async def community_search(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider, # Changed driver to provider
     cross_encoder: CrossEncoderClient,
     query: str,
     query_vector: list[float],
@@ -406,10 +418,10 @@ async def community_search(
 
     search_results: list[list[CommunityNode]] = list(
         await semaphore_gather(
-            *[
-                community_fulltext_search(driver, query, group_ids, 2 * limit),
-                community_similarity_search(
-                    driver, query_vector, group_ids, 2 * limit, config.sim_min_score
+            *[ # Call provider methods
+                provider.community_fulltext_search(query, group_ids, 2 * limit),
+                provider.community_similarity_search(
+                    query_vector, group_ids, 2 * limit, config.sim_min_score
                 ),
             ]
         )
@@ -422,22 +434,25 @@ async def community_search(
 
     reranked_uuids: list[str] = []
     if config.reranker == CommunityReranker.rrf:
-        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score)
+        reranked_uuids = rrf(search_result_uuids, min_score=reranker_min_score) # rrf is local
     elif config.reranker == CommunityReranker.mmr:
-        search_result_uuids_and_vectors = await get_embeddings_for_communities(
-            driver, list(community_uuid_map.values())
+        # get_embeddings_for_communities is now a provider method
+        search_result_uuids_and_vectors = await provider.get_embeddings_for_communities(
+            list(community_uuid_map.values())
         )
-
-        reranked_uuids = maximal_marginal_relevance(
+        reranked_uuids = maximal_marginal_relevance( # maximal_marginal_relevance is local
             query_vector, search_result_uuids_and_vectors, config.mmr_lambda, reranker_min_score
         )
     elif config.reranker == CommunityReranker.cross_encoder:
+        # This part remains the same
         name_to_uuid_map = {node.name: node.uuid for result in search_results for node in result}
         reranked_nodes = await cross_encoder.rank(query, list(name_to_uuid_map.keys()))
         reranked_uuids = [
             name_to_uuid_map[name] for name, score in reranked_nodes if score >= reranker_min_score
         ]
 
-    reranked_communities = [community_uuid_map[uuid] for uuid in reranked_uuids]
+    unique_reranked_uuids = list(dict.fromkeys(reranked_uuids))
+    reranked_communities = [community_uuid_map[uuid] for uuid in unique_reranked_uuids if uuid in community_uuid_map]
+
 
     return reranked_communities[:limit]
