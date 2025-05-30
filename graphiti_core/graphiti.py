@@ -266,7 +266,7 @@ class Graphiti:
                 )
                 if previous_episode_uuids is None
                 # Assuming EpisodicNode.get_by_uuids was refactored to take provider
-                else await self.provider.get_episodic_nodes_by_uuids(uuids=previous_episode_uuids) 
+                else await self.provider.get_episodic_nodes_by_uuids(uuids=previous_episode_uuids)
             )
 
             episode = (
@@ -423,7 +423,7 @@ class Graphiti:
             await semaphore_gather(*[episode.save(self.provider) for episode in episodes])
 
             # Get previous episode context for each episode
-            episode_pairs = await retrieve_previous_episodes_bulk(self.provider, episodes) 
+            episode_pairs = await retrieve_previous_episodes_bulk(self.provider, episodes)
 
             # Extract all nodes and edges
             (
@@ -448,29 +448,29 @@ class Graphiti:
             # Instead of individual saves, collect all and use provider's bulk add.
             # The original code here was saving nodes, then episodic edges, then entity edges.
             # This can be simplified by preparing all lists and calling provider.add_nodes_and_edges_bulk once.
-            
+
             # Episodic edges were already built. Entity edges need to be prepared.
             episodic_edges_final = resolve_edge_pointers(episodic_edges, uuid_map)
             entity_edges_final = await dedupe_edges_bulk(
                 self.provider, self.llm_client, resolve_edge_pointers(extracted_edges_timestamped, uuid_map)
             )
 
-            # Update episode.entity_edges for all episodes based on the final entity_edges
-            # This is complex as edges might be shared or deduped.
-            # For simplicity in this refactor, this detailed update is skipped.
-            # The main goal is to use provider for DB ops.
-            # A more robust approach would map final edges back to episodes.
+            # Note: Updating individual 'episode.entity_edges' for each of the initially saved
+            # episodes after deduplication and resolution of edges is a complex task.
+            # This current implementation focuses on bulk ingesting all unique nodes and edges.
+            # A more advanced version might track precise edge linkages back to each source episode.
 
-            # Consolidate all data and call provider's bulk add
+            # All extracted, processed, and deduplicated data is now passed to the provider's
+            # bulk add method for efficient database persistence.
             await self.provider.add_nodes_and_edges_bulk(
-                episodic_nodes=episodes, # The initial list of episodes
-                episodic_edges=episodic_edges_final,
-                entity_nodes=nodes, # Deduped and resolved nodes
-                entity_edges=entity_edges_final, # Deduped and resolved entity edges
-                embedder=self.embedder
+                episodic_nodes=episodes, # The initial list of (now saved) episodes
+                episodic_edges=episodic_edges_final, # Final list of episodic edges
+                entity_nodes=nodes, # Final list of unique/deduplicated entity nodes
+                entity_edges=entity_edges_final, # Final list of unique/deduplicated entity edges
+                embedder=self.embedder # Embedder for any potential internal embedding needs by the provider
             )
-            
-            logger.info(f'Completed add_episode_bulk processing and bulk saving.')
+
+            logger.info(f'Completed add_episode_bulk processing and delegated to provider for bulk saving.')
             end = time()
             logger.info(f'Total time for add_episode_bulk: {(end - start) * 1000} ms')
 
@@ -609,7 +609,7 @@ class Graphiti:
         for episode in episodes:
             if episode.entity_edges:
                 all_entity_edge_uuids.extend(episode.entity_edges)
-        
+
         # Fetch unique entity edges
         unique_entity_edge_uuids = list(dict.fromkeys(all_entity_edge_uuids))
         edges: list[EntityEdge] = []
@@ -635,7 +635,7 @@ class Graphiti:
         )
 
         updated_edge = resolve_edge_pointers([edge], uuid_map)[0]
-        
+
         # Use provider methods for get_relevant_edges and get_edge_invalidation_candidates
         related_edges_results = await self.provider.get_relevant_edges(edges=[updated_edge], search_filter=SearchFilters())
         related_edges = related_edges_results[0] if related_edges_results else []
@@ -659,9 +659,9 @@ class Graphiti:
                 group_id=edge.group_id,
             ),
         )
-        
+
         # add_nodes_and_edges_bulk utility takes provider
-        await add_nodes_and_edges_bulk( 
+        await add_nodes_and_edges_bulk(
             self.provider, [], [], resolved_nodes, [resolved_edge] + invalidated_edges, self.embedder
         )
 
@@ -693,7 +693,7 @@ class Graphiti:
         # This get_mentioned_nodes returns nodes linked via MENTIONS rel for Kuzu, or via episode.entity_edges for Neo4j's interpretation
         # The original logic implies nodes directly linked to this single episode.
         nodes_linked_to_episode = await self.provider.get_mentioned_nodes(episodes=[episode])
-        
+
         nodes_to_delete_uuids: list[str] = []
         for node in nodes_linked_to_episode:
             # Use the new provider method to count mentions for the node.
@@ -712,9 +712,9 @@ class Graphiti:
 
         if edges_to_delete_uuids:
             await semaphore_gather(*[self.provider.delete_edge(edge_uuid) for edge_uuid in edges_to_delete_uuids])
-        
+
         if nodes_to_delete_uuids:
             logger.info(f"Deleting nodes exclusively mentioned by episode {episode.uuid}: {nodes_to_delete_uuids}")
             await semaphore_gather(*[self.provider.delete_node(node_uuid) for node_uuid in nodes_to_delete_uuids])
-        
+
         await self.provider.delete_node(episode.uuid) # Delete the episode itself

@@ -226,6 +226,11 @@ async def resolve_extracted_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, BaseModel] | None = None,
 ) -> tuple[list[EntityNode], dict[str, str]]:
+    """
+    Resolves extracted entity nodes against existing nodes in the graph.
+    It uses the search functionality (via clients.provider) to find potential duplicates
+    and then employs an LLM to determine if an extracted node is a duplicate or new.
+    """
     llm_client = clients.llm_client
 
     search_results: list[SearchResults] = await semaphore_gather(

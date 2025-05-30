@@ -3,14 +3,14 @@ import logging
 from collections import defaultdict
 
 # Remove neo4j import, use provider
-# from neo4j import AsyncDriver 
+# from neo4j import AsyncDriver
 from pydantic import BaseModel
 
 from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
 from graphiti_core.edges import CommunityEdge
 from graphiti_core.embedder import EmbedderClient
 # DEFAULT_DATABASE might be Neo4j specific, consider if it's needed or part of provider config
-from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather 
+from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import CommunityNode, EntityNode, get_community_node_from_record # get_community_node_from_record might be provider specific parsing logic
 from graphiti_core.prompts import prompt_library
@@ -71,13 +71,13 @@ async def get_community_clusters(
             ]
 
         cluster_uuids = label_propagation(projection)
-        
+
         # Replace EntityNode.get_by_uuids with provider call
         # semaphore_gather might still be useful if provider.get_entity_nodes_by_uuids for many individual clusters is slow
         # But get_entity_nodes_by_uuids takes a list, so we can batch it if needed.
         # For now, let's assume one call per cluster or batching them if the provider method supports it well.
         # The original code did N calls for N clusters.
-        
+
         for cluster_uuid_list in cluster_uuids:
             if cluster_uuid_list: # Ensure list is not empty
                  # get_entity_nodes_by_uuids expects List[str]
@@ -228,7 +228,7 @@ async def build_communities(
     for community in communities:
         community_nodes.append(community[0])
         community_edges.extend(community[1])
-    
+
     # After building, these nodes and edges need to be saved using the provider.
     # This function should ideally also take the provider and save them.
     # For now, just returning them as per original structure.
@@ -267,7 +267,7 @@ async def determine_entity_community(
         c.group_id AS group_id,
         c.created_at AS created_at, 
         c.summary AS summary,
-        c.name_embedding AS name_embedding 
+        c.name_embedding AS name_embedding
     """, # Added name_embedding
         params={"entity_uuid": entity.uuid}
         # database_=DEFAULT_DATABASE,
@@ -331,7 +331,7 @@ async def update_community(
 
     community.summary = new_summary
     community.name = new_name
-    
+
     # Embedding generation should be handled by provider or before calling save method
     await community.generate_name_embedding(embedder) # This method is on the Pydantic model
 

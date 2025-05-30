@@ -95,12 +95,14 @@ class Node(BaseModel, ABC):
     created_at: datetime = Field(default_factory=lambda: utc_now())
 
     @abstractmethod
-    async def save(self, provider: GraphDatabaseProvider): ... # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current node instance to the database using the provided provider."""
+        pass
 
-    async def delete(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def delete(self, provider: GraphDatabaseProvider):
+        """Deletes the current node instance from the database using the provided provider."""
         await provider.delete_node(self.uuid) # Delegate to provider
         logger.debug(f'Deleted Node: {self.uuid} via provider')
-        # Return value might change based on provider.delete_node signature, assuming None for now
         return None 
 
     def __hash__(self):
@@ -127,10 +129,14 @@ class Node(BaseModel, ABC):
 
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): ... # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str):
+        """Retrieves a node of this type by its UUID using the provided provider."""
+        pass
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): ... # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]):
+        """Retrieves multiple nodes of this type by their UUIDs using the provided provider."""
+        pass
 
 
 class EpisodicNode(Node):
@@ -145,39 +151,40 @@ class EpisodicNode(Node):
         default_factory=list,
     )
 
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current EpisodicNode instance using the provided provider."""
         logger.debug(f'Saving EpisodicNode: {self.uuid} via provider')
-        return await provider.save_episodic_node(self) # Delegate to provider
+        return await provider.save_episodic_node(self)
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
-        # Delegate to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "EpisodicNode":
+        """Retrieves an EpisodicNode by its UUID using the provided provider."""
         node = await provider.get_episodic_node_by_uuid(uuid)
         if not node:
             raise NodeNotFoundError(uuid)
         return node
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
-        # Delegate to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["EpisodicNode"]:
+        """Retrieves multiple EpisodicNodes by their UUIDs using the provided provider."""
         return await provider.get_episodic_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
-        # Delegate to provider
+    ) -> List["EpisodicNode"]:
+        """Retrieves EpisodicNodes by group IDs using the provided provider."""
         return await provider.get_episodic_nodes_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
 
     @classmethod
-    async def get_by_entity_node_uuid(cls, provider: GraphDatabaseProvider, entity_node_uuid: str): # Changed driver to provider
-        # Delegate to provider
+    async def get_by_entity_node_uuid(cls, provider: GraphDatabaseProvider, entity_node_uuid: str) -> List["EpisodicNode"]:
+        """Retrieves EpisodicNodes connected to a given EntityNode UUID using the provided provider."""
         return await provider.get_episodic_nodes_by_entity_node_uuid(entity_node_uuid)
 
 
@@ -217,29 +224,33 @@ class EntityNode(Node):
                  raise NodeNotFoundError(self.uuid)
 
 
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current EntityNode instance using the provided provider."""
         logger.debug(f'Saving EntityNode: {self.uuid} via provider')
-        return await provider.save_entity_node(self) # Delegate to provider
+        return await provider.save_entity_node(self)
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "EntityNode":
+        """Retrieves an EntityNode by its UUID using the provided provider."""
         node = await provider.get_entity_node_by_uuid(uuid)
         if not node:
             raise NodeNotFoundError(uuid)
         return node
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["EntityNode"]:
+        """Retrieves multiple EntityNodes by their UUIDs using the provided provider."""
         return await provider.get_entity_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
+    ) -> List["EntityNode"]:
+        """Retrieves EntityNodes by group IDs using the provided provider."""
         return await provider.get_entity_nodes_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
@@ -249,9 +260,10 @@ class CommunityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
     summary: str = Field(description='region summary of member nodes', default_factory=str)
 
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current CommunityNode instance using the provided provider."""
         logger.debug(f'Saving CommunityNode: {self.uuid} via provider')
-        return await provider.save_community_node(self) # Delegate to provider
+        return await provider.save_community_node(self)
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
@@ -274,32 +286,36 @@ class CommunityNode(Node):
 
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "CommunityNode":
+        """Retrieves a CommunityNode by its UUID using the provided provider."""
         node = await provider.get_community_node_by_uuid(uuid)
         if not node:
             raise NodeNotFoundError(uuid)
         return node
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["CommunityNode"]:
+        """Retrieves multiple CommunityNodes by their UUIDs using the provided provider."""
         return await provider.get_community_nodes_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
+    ) -> List["CommunityNode"]:
+        """Retrieves CommunityNodes by group IDs using the provided provider."""
         return await provider.get_community_nodes_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
 
 
 # Node helpers
-# These helpers are primarily used by Neo4jProvider now.
-# They might be moved to the provider module or a shared parsing utility later.
+# These helpers are primarily used by Neo4jProvider for parsing raw query results.
+# Other providers (like KuzuDBProvider) might have their own internal parsing methods
+# that directly construct Pydantic models.
 def get_episodic_node_from_record(record: Any) -> EpisodicNode:
     # Corrected created_at parsing
     created_at_val = record['created_at']
@@ -316,7 +332,7 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
 
     return EpisodicNode(
         content=record['content'],
-        created_at=created_at_dt, 
+        created_at=created_at_dt,
         valid_at=valid_at_dt,
         uuid=record['uuid'],
         group_id=record['group_id'],
@@ -373,58 +389,17 @@ def get_community_node_from_record(record: Any) -> CommunityNode:
 
 
 async def create_entity_node_embeddings(embedder: EmbedderClient, nodes: list[EntityNode]):
-    # This utility function might be better placed elsewhere or used by providers internally if needed.
-    # Or called by Graphiti class before passing nodes to provider's bulk save.
+    # This utility function is primarily called by Graphiti class or other high-level logic
+    # before passing nodes to a provider's bulk save operation, or for ad-hoc embedding.
+    # It operates on Pydantic model instances directly.
+    if not nodes:
+        return
     name_embeddings_list = await embedder.create_batch([node.name for node in nodes])
-    for node, name_embedding_list_item in zip(nodes, name_embeddings_list, strict=True):
-        if name_embedding_list_item and isinstance(name_embedding_list_item, list):
-             node.name_embedding = name_embedding_list_item # Assuming create_batch returns List[List[float]]
-        else: # Fallback if structure is not List[List[float]] but List[float] for a single item batch
-             node.name_embedding = name_embedding_list_item # This assignment might be incorrect depending on actual return type
-        created_at=record['created_at'].to_native().timestamp(),
-        valid_at=(record['valid_at'].to_native()),
-        uuid=record['uuid'],
-        group_id=record['group_id'],
-        source=EpisodeType.from_str(record['source']),
-        name=record['name'],
-        source_description=record['source_description'],
-        entity_edges=record['entity_edges'],
-    )
+    for node, name_embedding_item in zip(nodes, name_embeddings_list, strict=True):
+        # Assuming create_batch returns a list of embeddings (List[List[float]]),
+        # and each item in that list is an embedding for the corresponding node.
+        node.name_embedding = name_embedding_item
 
-
-def get_entity_node_from_record(record: Any) -> EntityNode:
-    entity_node = EntityNode(
-        uuid=record['uuid'],
-        name=record['name'],
-        group_id=record['group_id'],
-        labels=record['labels'],
-        created_at=record['created_at'].to_native(),
-        summary=record['summary'],
-        attributes=record['attributes'],
-    )
-
-    entity_node.attributes.pop('uuid', None)
-    entity_node.attributes.pop('name', None)
-    entity_node.attributes.pop('group_id', None)
-    entity_node.attributes.pop('name_embedding', None)
-    entity_node.attributes.pop('summary', None)
-    entity_node.attributes.pop('created_at', None)
-
-    return entity_node
-
-
-def get_community_node_from_record(record: Any) -> CommunityNode:
-    return CommunityNode(
-        uuid=record['uuid'],
-        name=record['name'],
-        group_id=record['group_id'],
-        name_embedding=record['name_embedding'],
-        created_at=record['created_at'].to_native(),
-        summary=record['summary'],
-    )
-
-
-async def create_entity_node_embeddings(embedder: EmbedderClient, nodes: list[EntityNode]):
-    name_embeddings = await embedder.create_batch([node.name for node in nodes])
-    for node, name_embedding in zip(nodes, name_embeddings, strict=True):
-        node.name_embedding = name_embedding
+# The duplicated get_entity_node_from_record and get_community_node_from_record
+# and the final create_entity_node_embeddings were removed as they were exact duplicates
+# of earlier versions in the file.

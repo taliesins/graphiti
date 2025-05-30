@@ -350,7 +350,11 @@ class Neo4jProvider(GraphDatabaseProvider):
         return result[0]['uuid'] if result else None
 
     async def save_entity_node(self, node: EntityNode) -> Any:
-        # Adapted from EntityNode.save()
+        # This method saves an EntityNode to Neo4j.
+        # It handles dynamic labels by merging the base :Entity label and then
+        # individually setting additional labels specified in node.labels.
+        # Properties are set using SET n += $props_to_set to merge, and vector embeddings
+        # are set using the db.create.setNodeVectorProperty procedure.
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
             'name': node.name,
@@ -412,44 +416,38 @@ class Neo4jProvider(GraphDatabaseProvider):
         # RETURN n.uuid AS uuid"""
         #
         # A direct adaptation:
-        # The $labels parameter in the original query might be intended for UNWIND and FOREACH for APOC, or similar.
-        # Given the constraints, I will formulate a query that sets labels one by one if needed,
-        # or assumes labels are part of entity_data if the MERGE handles it.
-        # The `SET n = $entity_data` will overwrite labels if they are not part of $entity_data map.
-        # The safest approach is to ensure labels are part of the initial MERGE if possible.
+        # The approach for setting labels (`SET n:\`label\`` for each label in node.labels)
+        # is standard Cypher and generally robust for controlled label names.
+        # It avoids needing APOC procedures for this basic operation.
+        
+        query_parts = [f"MERGE (n:Entity {{uuid: $entity_data.uuid}})"] # Base label :Entity
+        # Add other labels using SET n:`label`
+        for label in node.labels: # node.labels should not contain 'Entity' as it's in MERGE
+            if label != "Entity": # Defensive check
+                query_parts.append(f"SET n:`{label}`") # Use backticks for safety
 
-        # Let's assume labels are applied using a specific convention that the original query relied on.
-        # If `SET n:$($labels)` means something like `SET n:Label1:Label2`, then:
+        # Set/update properties using += to merge (preserve existing, update/add new)
+        # Note: uuid is part of MERGE key, name_embedding handled by procedure.
+        query_parts.append("SET n += $props_to_set")
+
+        # Set vector property using the specific procedure
+        # Ensure name_embedding is passed in entity_data for the procedure call.
+        if node.name_embedding is not None: # Only call if there's an embedding
+            query_parts.append("WITH n, $entity_data AS data CALL db.create.setNodeVectorProperty(n, 'name_embedding', data.name_embedding)")
         
-        # Create the query string to set labels dynamically
-        # This is still tricky with pure execute_query if $labels is a list.
-        # The original code had `labels=self.labels + ['Entity']` passed to execute_query.
-        # Neo4j driver does not automatically expand list of strings into multiple labels in SET clause.
-        # The original query `SET n:$($labels)` is likely from a higher-level library or ORM.
-        # I will proceed by creating a query that adds labels using SET.
-        
-        # Constructing the query string
-        # Start with merging the node with the 'Entity' label
-        query_parts = [f"MERGE (n:Entity {{uuid: $entity_data.uuid}})"]
-        # Add other labels using SET
-        for label in node.labels:
-            query_parts.append(f"SET n:`{label}`") # Use backticks for safety if labels have special chars
-        query_parts.append("SET n += $props_to_set") # Use += to merge properties, not overwrite all
-        query_parts.append("WITH n, $entity_data AS data CALL db.create.setNodeVectorProperty(n, 'name_embedding', data.name_embedding)")
         query_parts.append("RETURN n.uuid AS uuid")
         
         final_query = "\n".join(query_parts)
 
-        # Properties to set should not include uuid if it's in MERGE, and should not include labels
-        props_to_set = entity_data.copy()
-        props_to_set.pop('uuid', None) # uuid is in MERGE
-        # name_embedding is handled by setNodeVectorProperty
+        # Prepare properties for SET n += $props_to_set
+        # Exclude uuid (match key) and name_embedding (handled by procedure).
+        props_to_set = {k: v for k, v in entity_data.items() if k not in ['uuid', 'name_embedding']}
 
         result, _, _ = await self.execute_query(
             final_query,
             params={
-                "entity_data": entity_data, # Contains name_embedding for the vector property call
-                "props_to_set": props_to_set
+                "entity_data": entity_data, # Passed for uuid in MERGE and vector procedure
+                "props_to_set": props_to_set  # Passed for SET n += $props_to_set
             }
         )
         logger.debug(f'Saved EntityNode to neo4j: {node.uuid}')
@@ -878,7 +876,7 @@ class Neo4jProvider(GraphDatabaseProvider):
     async def retrieve_episodes(
         self,
         reference_time: datetime,
-        last_n: int = EPISODE_WINDOW_LEN, 
+        last_n: int = EPISODE_WINDOW_LEN,
         group_ids: Optional[List[str]] = None,
         source: Optional[EpisodeType] = None,
     ) -> List[EpisodicNode]:
@@ -1387,87 +1385,105 @@ class Neo4jProvider(GraphDatabaseProvider):
 
     async def get_relevant_nodes(
         self, nodes: List[EntityNode], search_filter: SearchFilters, 
-        min_score: float = DEFAULT_MIN_SCORE, limit: int = RELEVANT_SCHEMA_LIMIT
+        min_score: float = DEFAULT_MIN_SCORE, # min_score for vector search part, not RRF directly
+        limit: int = RELEVANT_SCHEMA_LIMIT,
+        rrf_k: int = 60 # RRF constant for Reciprocal Rank Fusion
     ) -> List[List[EntityNode]]:
-        # This method in search_utils combines fulltext and vector search for each input node.
-        # It's complex and uses specific query structures.
+        """
+        Finds relevant entity nodes for a given list of entity nodes using a combination of
+        vector similarity search and full-text search, with results combined using
+        Reciprocal Rank Fusion (RRF).
+
+        For each input node, this method:
+        1. Performs a vector similarity search based on `node.name_embedding`.
+        2. Performs a full-text search based on `node.name` and `node.summary` (via Lucene index).
+        3. Fetches up to `limit * 2` candidates from each search type to ensure a good pool for RRF.
+        4. Calculates RRF scores for all unique candidates found.
+        5. Returns the top `limit` nodes, ordered by their RRF score.
+        """
         if not self.driver: raise ConnectionError("Driver not initialized.")
         if not nodes: return []
 
-        # Group by group_id as the original query assumes a single group_id from the first node.
-        # This might need adjustment if nodes can be from different groups.
-        # For now, processing per node, which might involve multiple group_ids if nodes list is diverse.
-        
-        all_relevant_nodes_map: Dict[str, List[EntityNode]] = {}
-        
-        # This operation can be slow if run for many nodes. Consider batching or optimization if performance issues arise.
-        for node in nodes:
-            if not node.name_embedding: # Skip if no embedding for similarity search part
-                # Optionally, could do only fulltext part or skip entirely
-                all_relevant_nodes_map[node.uuid] = []
+        all_final_nodes_map: Dict[str, List[EntityNode]] = {}
+        from collections import defaultdict # Import defaultdict for rrf_scores
+
+        for node_obj in nodes: # Renamed 'node' to 'node_obj' to avoid conflict
+            if not node_obj.name_embedding:
+                all_final_nodes_map[node_obj.uuid] = []
                 continue
 
-            filter_query_clause, filter_params = _node_search_filter_query_constructor(search_filter)
+            filter_query_clause, filter_params_base = _node_search_filter_query_constructor(search_filter)
             
-            # Prepare parameters for this specific node
+            # Fetch more results initially for RRF (e.g., limit * 2 or a fixed larger number)
+            # This provides a larger candidate pool for better RRF ranking.
+            individual_search_limit = limit * 2
+
             node_params = {
-                "node_uuid": node.uuid,
-                "node_name_embedding": node.name_embedding,
-                "node_fulltext_query": _fulltext_lucene_query(node.name, [node.group_id] if node.group_id else None),
-                "group_id": node.group_id, # Assuming search is within the same group_id
-                "limit": limit,
-                "min_score": min_score,
-                **filter_params
+                "node_uuid": node_obj.uuid,
+                "node_name_embedding": node_obj.name_embedding,
+                "node_fulltext_query": _fulltext_lucene_query(node_obj.name, [node_obj.group_id] if node_obj.group_id else None),
+                "group_id": node_obj.group_id, # Assuming search is within the same group_id for relevance
+                "limit": individual_search_limit,
+                "min_score_vec": min_score, # min_score for the initial vector search candidate generation
+                **filter_params_base
             }
             
-            # Simplified query combining vector and fulltext search for a single source node.
-            # The original query in search_utils is more complex, using WITH clauses to chain.
-            # This adapted version attempts a similar logic.
-            # It first gets vector results, then fulltext, then combines.
-            # Note: This is a simplified adaptation. The original query's rrf-like logic is not fully replicated here
-            # due to complexity of translating directly. This version gets top N from vector, top N from fulltext,
-            # then combines and de-duplicates.
-
-            # Vector search part
+            # 1. Vector Search: Retrieves UUIDs and similarity scores for candidate nodes.
+            # Nodes are matched by group_id, must not be the input node itself, and must have an embedding.
+            # Results are ordered by similarity score descending and limited.
             vector_query = f"""
                 MATCH (n_target:Entity {{group_id: $group_id}})
                 WHERE n_target.uuid <> $node_uuid AND n_target.name_embedding IS NOT NULL {filter_query_clause.replace(" n:", " n_target:")}
                 WITH n_target, vector.similarity.cosine(n_target.name_embedding, $node_name_embedding) AS score
-                WHERE score >= $min_score
-                RETURN n_target AS n, score
+                WHERE score >= $min_score_vec
+                RETURN n_target.uuid AS uuid, score
                 ORDER BY score DESC
                 LIMIT $limit
             """
-            vector_records, _, _ = await self.execute_query(vector_query, params=node_params)
+            vector_raw_results, _, _ = await self.execute_query(vector_query, params=node_params)
             
-            # Fulltext search part
-            fulltext_records = []
-            if node_params["node_fulltext_query"]:
+            # 2. Full-text Search: Retrieves UUIDs and relevance scores from Lucene index.
+            # Nodes are matched by Lucene query, must be Entity type, not the input node,
+            # and belong to the same group_id. Results ordered by score and limited.
+            fulltext_raw_results = []
+            if node_params["node_fulltext_query"]: # Only run if a valid Lucene query is formed
                 fulltext_query_cypher = f"""
                     CALL db.index.fulltext.queryNodes("node_name_and_summary", $node_fulltext_query, {{limit: $limit}})
                     YIELD node AS n_target, score
                     WHERE n_target:Entity AND n_target.uuid <> $node_uuid AND n_target.group_id = $group_id {filter_query_clause.replace(" n:", " n_target:")}
-                    RETURN n_target AS n, score
+                    RETURN n_target.uuid AS uuid, score
                     ORDER BY score DESC
                     LIMIT $limit
                 """
-                fulltext_records, _, _ = await self.execute_query(fulltext_query_cypher, params=node_params)
+                fulltext_raw_results, _, _ = await self.execute_query(fulltext_query_cypher, params=node_params)
 
-            # Combine and deduplicate results
-            temp_relevant_nodes: Dict[str, EntityNode] = {}
-            for r in vector_records:
-                match_node = get_entity_node_from_record(r["n"])
-                if match_node.uuid not in temp_relevant_nodes:
-                    temp_relevant_nodes[match_node.uuid] = match_node
+            # 3. RRF Calculation: Combine scores from both search methods.
+            # Each node's RRF score is the sum of reciprocal ranks from each list it appears in.
+            rrf_scores: Dict[str, float] = defaultdict(float)
             
-            for r in fulltext_records:
-                match_node = get_entity_node_from_record(r["n"])
-                if match_node.uuid not in temp_relevant_nodes:
-                     temp_relevant_nodes[match_node.uuid] = match_node
-            
-            all_relevant_nodes_map[node.uuid] = list(temp_relevant_nodes.values())[:limit]
+            for rank, record in enumerate(vector_raw_results):
+                rrf_scores[record["uuid"]] += 1.0 / (rrf_k + rank + 1) # rank is 0-indexed
 
-        return [all_relevant_nodes_map.get(node.uuid, []) for node in nodes]
+            for rank, record in enumerate(fulltext_raw_results):
+                rrf_scores[record["uuid"]] += 1.0 / (rrf_k + rank + 1)
+
+            # Sort candidate UUIDs by their combined RRF score in descending order.
+            sorted_uuids_by_rrf = sorted(rrf_scores.keys(), key=lambda u: rrf_scores[u], reverse=True)
+
+            # 4. Fetch top N EntityNode objects based on final RRF ranking.
+            final_node_uuids_to_fetch = sorted_uuids_by_rrf[:limit] # Apply final limit
+
+            if final_node_uuids_to_fetch:
+                # Retrieve full node objects for the top-ranked UUIDs.
+                final_nodes = await self.get_entity_nodes_by_uuids(uuids=final_node_uuids_to_fetch)
+                # Re-sort the fetched nodes based on the RRF score order, as get_entity_nodes_by_uuids
+                # might not preserve the input order of UUIDs.
+                final_nodes_dict = {n.uuid: n for n in final_nodes}
+                all_final_nodes_map[node_obj.uuid] = [final_nodes_dict[uuid] for uuid in final_node_uuids_to_fetch if uuid in final_nodes_dict]
+            else:
+                all_final_nodes_map[node_obj.uuid] = []
+
+        return [all_final_nodes_map.get(n.uuid, []) for n in nodes]
 
 
     async def get_relevant_edges(
@@ -1623,7 +1639,7 @@ class Neo4jProvider(GraphDatabaseProvider):
     async def count_node_mentions(self, node_uuid: str) -> int:
         if not self.driver:
             raise ConnectionError("Driver not initialized. Call connect() first.")
-        
+
         # This query counts distinct episodic nodes that mention the given entity node.
         # It assumes the relationship is (:Episodic)-[:MENTIONS]->(:Entity)
         query = """
@@ -1652,6 +1668,10 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
         entity_edges: List[EntityEdge],
         embedder: EmbedderClient
     ) -> None:
+        """
+        Adds nodes and edges in bulk to Neo4j using batched Cypher queries within a single transaction.
+        Embeddings are generated for nodes and edges if not already present before the transaction begins.
+        """
         if not self.driver:
             raise ConnectionError("Driver not initialized. Call connect() first.")
 
@@ -1661,39 +1681,23 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
             tx: AsyncManagedTransaction, # Comes from Neo4j driver
             ep_nodes: List[EpisodicNode],
             ep_edges: List[EpisodicEdge],
-            en_nodes: List[EntityNode],
-            en_edges: List[EntityEdge],
-            emb_client: EmbedderClient,
+            en_nodes: List[EntityNode], # Embeddings are pre-generated for these
+            en_edges: List[EntityEdge], # Embeddings are pre-generated for these
+            emb_client: EmbedderClient, # Passed for any potential deeper use, though primary embedding is outside
         ):
             # Prepare EpisodicNode data
             episodes_data = []
             for episode_node in ep_nodes:
-                data = episode_node.model_dump(exclude_none=False) # Use exclude_none=False to include nulls if schema expects them
-                data['source'] = str(episode_node.source.value) # Ensure enum is string
-                # Ensure all schema fields are present for Cypher query
+                data = episode_node.model_dump(exclude_none=False)
+                data['source'] = str(episode_node.source.value)
                 for key in ['uuid', 'name', 'group_id', 'source', 'source_description', 'content', 'valid_at', 'created_at', 'entity_edges']:
                     data.setdefault(key, None)
                 if data['entity_edges'] is None: data['entity_edges'] = []
                 episodes_data.append(data)
 
-            # Prepare EntityNode data and generate embeddings
+            # Prepare EntityNode data (embeddings are already generated)
             entity_nodes_data = []
             for node in en_nodes:
-                if node.name_embedding is None and hasattr(node, 'name') and node.name:
-                    # Assuming node.generate_name_embedding is not an async function directly
-                    # If it were, this would need to be done outside the tx or use an async embedder call
-                    # For now, adapting the structure where embedding generation was part of the tx function body in bulk_utils
-                    # This implies that embedder.create might be blocking if called like this.
-                    # Ideally, embeddings are generated before this tx function.
-                    # The original code called `await node.generate_name_embedding(embedder)`
-                    # which suggests it was async. This means it should be done *before* starting the transaction,
-                    # or the embedder client itself needs to be async and used with await.
-                    # For this refactoring, I'll keep the await, assuming embedder client is async.
-                    text_to_embed = node.name.replace('\n', ' ') # From Kuzu provider bulk
-                    embedding_result = await emb_client.create(input_data=[text_to_embed])
-                    if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
-                         node.name_embedding = embedding_result[0]
-
                 entity_data: dict[str, Any] = {
                     'uuid': node.uuid,
                     'name': node.name,
@@ -1702,25 +1706,17 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
                     'summary': node.summary,
                     'created_at': node.created_at,
                 }
-                # Add attributes and ensure labels are correctly formatted
                 entity_data.update(node.attributes or {})
-                # The ENTITY_NODE_SAVE_BULK query expects $labels to be a list of strings.
                 entity_data['labels'] = list(set(node.labels + ['Entity']))
                 entity_nodes_data.append(entity_data)
 
-            # Prepare EntityEdge data and generate embeddings
+            # Prepare EntityEdge data (embeddings are already generated)
             entity_edges_data = []
             for edge in en_edges:
-                if edge.fact_embedding is None and hasattr(edge, 'fact') and edge.fact:
-                    text_to_embed = edge.fact.replace('\n', ' ') # From Kuzu provider bulk
-                    embedding_result = await emb_client.create(input_data=[text_to_embed])
-                    if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
-                        edge.fact_embedding = embedding_result[0]
-                
                 edge_data: dict[str, Any] = {
                     'uuid': edge.uuid,
-                    'source_node_uuid': edge.source_node_uuid, # Used by query to MATCH source
-                    'target_node_uuid': edge.target_node_uuid, # Used by query to MATCH target
+                    'source_node_uuid': edge.source_node_uuid,
+                    'target_node_uuid': edge.target_node_uuid,
                     'name': edge.name,
                     'fact': edge.fact,
                     'fact_embedding': edge.fact_embedding,
@@ -1734,21 +1730,15 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
                 edge_data.update(edge.attributes or {})
                 if edge_data['episodes'] is None: edge_data['episodes'] = []
                 entity_edges_data.append(edge_data)
-            
-            # Prepare EpisodicEdge data
-            # EPISODIC_EDGE_SAVE_BULK expects a list of dicts, each dict being edge.model_dump()
+
             episodic_edges_prepared_data = []
             for ep_edge in ep_edges:
                 data = ep_edge.model_dump(exclude_none=False)
-                # Ensure all schema fields are present for Cypher query
                 for key in ['uuid', 'source_node_uuid', 'target_node_uuid', 'group_id', 'created_at']:
                     data.setdefault(key, None)
                 episodic_edges_prepared_data.append(data)
 
-
-            # Execute bulk queries
-            # These queries are defined in graphiti_core.models.*.node_db_queries etc.
-            # and should be available in the Neo4jProvider's scope (already imported).
+            # Execute bulk Cypher queries
             if episodes_data:
                 await tx.run(EPISODIC_NODE_SAVE_BULK, episodes=episodes_data)
             if entity_nodes_data:
@@ -1757,23 +1747,18 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
                 await tx.run(EPISODIC_EDGE_SAVE_BULK, episodic_edges=episodic_edges_prepared_data)
             if entity_edges_data:
                 await tx.run(ENTITY_EDGE_SAVE_BULK, entity_edges=entity_edges_data)
-            
+
             logger.info(f"Neo4j bulk transaction processed: {len(ep_nodes)} ep_nodes, {len(en_nodes)} en_nodes, {len(ep_edges)} ep_edges, {len(en_edges)} en_edges.")
 
-        # Embedding generation should ideally happen *before* the transaction if it involves network I/O
-        # and the embedder client is not designed for use within a DB transaction context.
-        # The original `add_nodes_and_edges_bulk_tx` did it inside.
-        # For Kuzu, it was outside. Let's keep it consistent with Kuzu and do it outside the Neo4j transaction too.
-        
+        # Perform embedding generation before starting the database transaction.
         logger.info(f"Neo4jProvider: Starting bulk add. Generating embeddings first...")
-        # Entity Nodes Embeddings
         for node in entity_nodes:
             if node.name_embedding is None and hasattr(node, 'name') and node.name:
                 text_to_embed = node.name.replace('\n', ' ')
                 embedding_result = await embedder.create(input_data=[text_to_embed])
                 if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
                     node.name_embedding = embedding_result[0]
-        
+
         # Entity Edges Embeddings
         for edge in entity_edges:
             if edge.fact_embedding is None and hasattr(edge, 'fact') and edge.fact:

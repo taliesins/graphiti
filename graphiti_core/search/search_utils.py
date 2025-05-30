@@ -68,27 +68,28 @@ DEFAULT_MMR_LAMBDA = 0.5  # General constant
 # 2. Kept here if purely algorithmic (e.g., rrf, maximal_marginal_relevance)
 # 3. Refactored to use provider if they were helpers making DB calls (e.g., get_mentioned_nodes)
 
-async def get_episodes_by_mentions( # This function seems to be unused by search.py, consider removal or refactor
-    provider: GraphDatabaseProvider, # Changed driver to provider
-    nodes: list[EntityNode], # Unused parameter
-    edges: list[EntityEdge],
+async def get_episodes_by_mentions(
+    provider: GraphDatabaseProvider,
+    edges: list[EntityEdge], # Removed unused 'nodes' parameter
     limit: int = RELEVANT_SCHEMA_LIMIT,
 ) -> list[EpisodicNode]:
+    """
+    Retrieves episodic nodes associated with a list of entity edges.
+    Note: This function seems to be unused by search.py and might be a candidate for removal.
+    """
     episode_uuids: list[str] = []
     for edge in edges:
         if edge.episodes: # Ensure episodes list is not None
             episode_uuids.extend(edge.episodes)
-    
+
     if not episode_uuids:
         return []
-        
+
     # Use provider.get_episodic_nodes_by_uuids
-    # Take unique UUIDs before querying, and then apply limit if necessary (though limit on UUIDs list is fine)
+    # Take unique UUIDs before querying.
     unique_episode_uuids = list(dict.fromkeys(episode_uuids)) # Preserve order while making unique
-    
-    # The limit here applies to how many UUIDs to fetch, not a DB limit.
-    # If the number of UUIDs is very large, it might be better to let the DB handle the limit.
-    # For now, respecting the original logic of limiting the list of UUIDs passed.
+
+    # The limit here applies to how many UUIDs to fetch.
     episodes = await provider.get_episodic_nodes_by_uuids(uuids=unique_episode_uuids[:limit])
     return episodes
 
@@ -115,11 +116,16 @@ def rrf(results: list[list[str]], rank_const=1, min_score: float = 0) -> list[st
 
 
 async def node_distance_reranker( # This function makes DB calls via driver
-    provider: GraphDatabaseProvider, # Changed driver to provider
+    provider: GraphDatabaseProvider,
     node_uuids: list[str],
     center_node_uuid: str,
     min_score: float = 0,
 ) -> list[str]:
+    """
+    Reranks a list of node UUIDs based on their shortest path distance to a center node.
+    Nodes closer to the center_node_uuid are ranked higher.
+    The Cypher query for shortest path may have provider-specific syntax or performance characteristics.
+    """
     filtered_uuids = list(filter(lambda node_uuid: node_uuid != center_node_uuid, node_uuids))
     scores: dict[str, float] = {center_node_uuid: 0.0}
 
@@ -179,11 +185,16 @@ async def node_distance_reranker( # This function makes DB calls via driver
 
 
 async def episode_mentions_reranker( # This function makes DB calls via driver
-    provider: GraphDatabaseProvider, # Changed driver to provider
-    node_uuids: list[list[str]], # This is list of lists of uuids
+    provider: GraphDatabaseProvider,
+    node_uuids: list[list[str]], # This is list of lists of uuids, typically from multiple search sources
     min_score: float = 0
 ) -> list[str]:
-    sorted_uuids_flat = rrf(node_uuids) # Flatten and initial rank
+    """
+    Reranks node UUIDs based on the count of distinct episodic mentions.
+    Nodes mentioned in more episodes are ranked higher.
+    The underlying Cypher query's performance for counting mentions might vary by provider.
+    """
+    sorted_uuids_flat = rrf(node_uuids) # Flatten and initial rank using RRF
     scores: dict[str, float] = {uuid: 0.0 for uuid in sorted_uuids_flat}
 
 

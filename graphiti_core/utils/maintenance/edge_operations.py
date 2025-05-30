@@ -262,6 +262,10 @@ async def resolve_extracted_edges(
     edge_types: dict[str, BaseModel],
     edge_type_map: dict[tuple[str, str], list[str]],
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
+    """
+    Resolves extracted edges against existing graph data using the configured provider
+    and LLM-based deduplication and contradiction checking.
+    """
     provider = clients.provider # Changed from clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder

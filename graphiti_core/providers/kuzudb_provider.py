@@ -175,25 +175,65 @@ class KuzuDBProvider(GraphDatabaseProvider):
             source_node_uuid=row_dict['source_node_uuid'], target_node_uuid=row_dict['target_node_uuid']
         )
     
-    async def _save_node_generic(self, table_name: str, node_dict: Dict[str, Any], uuid: str) -> str:
-        if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # UPSERT logic: Try to update first (MATCH SET), if not found (or Kuzu specific error), then CREATE.
-        # Kuzu's Cypher might not support MERGE or complex ON MATCH/ON CREATE yet.
-        # Simplified: Attempt CREATE, if PK error, attempt UPDATE.
-        # This is not atomic and less efficient. Better to use Kuzu's specific UPSERT if available.
+    async def _save_node_generic(self, table_name: str, node_dict: Dict[str, Any], uuid_param: str) -> str:
+        """
+        Generic helper to save (upsert) a node using KuzuDB's MERGE statement.
+        It matches on 'uuid' and sets/updates other properties.
+        """
+        if not self.connection:
+            raise ConnectionError("KuzuDB connection not established.")
+
+        # Using MERGE for upsert. node_dict contains all properties, including 'uuid'.
+
+        # Properties for ON CREATE SET and ON MATCH SET clauses.
+        # Kuzu's MERGE requires explicit SET clauses for each property.
+
+        on_create_set_clauses = []
+        param_prefix = "p_" # Prefix for parameters in SET clauses to avoid conflict
+
+        # All properties from node_dict are set on create.
+        for key in node_dict.keys():
+            on_create_set_clauses.append(f"n.{key} = ${param_prefix}{key}")
+
+        # On match, update all properties except the primary key 'uuid'.
+        on_match_set_clauses = []
+        for key in node_dict.keys():
+            if key != "uuid": # Don't try to update the primary key itself in SET
+                on_match_set_clauses.append(f"n.{key} = ${param_prefix}{key}")
+
+        # Build the MERGE query
+        # The MERGE clause matches on the primary key 'uuid'.
+        query = f"MERGE (n:{table_name} {{uuid: $match_uuid}})"
+
+        if on_create_set_clauses:
+            query += f" ON CREATE SET {', '.join(on_create_set_clauses)}"
+
+        # Only add ON MATCH SET if there are properties to update (other than uuid).
+        if on_match_set_clauses:
+            query += f" ON MATCH SET {', '.join(on_match_set_clauses)}"
+        else:
+            # If only 'uuid' was in node_dict, there's nothing to set on match.
+            # KuzuDB's MERGE requires ON CREATE SET if the node doesn't exist.
+            # If ON MATCH is omitted, it won't update existing nodes, which is fine if that's the intent
+            # for a create-only-if-not-exists scenario, but here we want upsert.
+            # However, if on_match_set_clauses is empty, it means only 'uuid' was in node_dict
+            # (after filtering), so no properties to update anyway.
+            pass
+
+        # Prepare parameters for the query
+        params = {"match_uuid": uuid_param}
+        for key, value in node_dict.items():
+            params[f"{param_prefix}{key}"] = value # e.g., p_name, p_group_id
+
         try:
-            create_query = f"CREATE (n:{table_name} $props)"
-            await self.execute_query(create_query, {"props": node_dict})
-        except Exception as e_create: # Catch specific Kuzu PK violation error if possible
-            logger.debug(f"CREATE failed for {table_name} {uuid} (may already exist), attempting UPDATE: {e_create}")
-            try:
-                set_clauses = ", ".join([f"n.{key} = ${key}" for key in node_dict if key != 'uuid'])
-                update_query = f"MATCH (n:{table_name} {{uuid: $uuid}}) SET {set_clauses}"
-                await self.execute_query(update_query, {**node_dict, "uuid": uuid}) # Pass uuid for MATCH, others for SET
-            except Exception as e_update:
-                logger.error(f"UPDATE also failed for {table_name} {uuid} after CREATE failed: {e_update}")
-                raise e_update # Or handle as appropriate
-        return uuid
+            await self.execute_query(query, params)
+        except Exception as e:
+            logger.error(f"MERGE operation failed for {table_name} {uuid_param}: {e}. Query: {query}")
+            # Avoid logging params directly if they might contain sensitive data or are very large.
+            # Consider logging only keys or specific non-sensitive params for debugging if necessary.
+            # logger.debug(f"Failed MERGE Params: {list(params.keys())}")
+            raise e
+        return uuid_param
 
     async def save_entity_node(self, node: EntityNode) -> Any:
         node_dict = node.model_dump(exclude_none=True)
@@ -327,14 +367,14 @@ class KuzuDBProvider(GraphDatabaseProvider):
             ON CREATE SET {set_clauses}
             ON MATCH SET {set_clauses}
         """
-        
+
         params = {
             "source_uuid": edge_dict["source_node_uuid"],
             "target_uuid": edge_dict["target_node_uuid"],
             "edge_uuid_param": uuid, # The UUID of the edge for the MERGE condition
             **props_for_rel # Spread all properties for use in SET clauses (e.g. $uuid, $group_id etc.)
         }
-        
+
         try:
             await self.execute_query(query, params)
         except Exception as e:
@@ -505,20 +545,43 @@ class KuzuDBProvider(GraphDatabaseProvider):
         return list(reversed(episodes))
 
     # --- Search Operations (Basic KuzuDB Implementations) ---
-    def _apply_search_filters_to_query_basic(self, query_parts: List[str], params: Dict[str, Any], search_filter: SearchFilters, node_alias: str = "n", edge_alias: Optional[str] = None):
-        # This is a very basic filter application, primarily for group_id if not already handled,
-        # and simple property checks. Kuzu's specific functions for dates, lists, etc., would be needed for full SearchFilter support.
-        # For now, this helper is minimal.
-        # Example: if search_filter.custom_property_equals and node_alias:
-        #    query_parts.append(f"AND {node_alias}.someProperty = $some_prop_val")
-        #    params["some_prop_val"] = search_filter.custom_property_equals
-        pass
+    def _apply_search_filters_to_query_basic(
+        self,
+        search_filter: SearchFilters,
+        alias: str, # e.g., "n" for node, "r" for relationship
+        params: Dict[str, Any] # to add new parameter names and values
+    ) -> str: # Returns a string of Cypher WHERE clauses
+        """
+        Applies basic property filters from SearchFilters.
+        Note: This is a simplified filter application. KuzuDB might require
+        specific functions for date, list operations, or complex types.
+        This current version primarily demonstrates adding exact match filters.
+        SearchFilters model would need to be extended to carry these specific filter fields.
+        """
+        filter_clauses: List[str] = []
+
+        # Hypothetical example: if SearchFilters had a 'name_must_equal' field
+        if hasattr(search_filter, 'name_must_equal') and search_filter.name_must_equal is not None:
+            param_name = f"{alias}_name_filter"
+            filter_clauses.append(f"{alias}.name = ${param_name}")
+            params[param_name] = search_filter.name_must_equal
+
+        # Hypothetical example: if SearchFilters had 'custom_properties_equal' as Dict[str, Any]
+        if hasattr(search_filter, 'custom_properties_equal') and search_filter.custom_properties_equal:
+            for prop_name, prop_value in search_filter.custom_properties_equal.items():
+                # Sanitize prop_name if it can come from user input (not an issue here)
+                param_name = f"{alias}_custom_{prop_name}"
+                filter_clauses.append(f"{alias}.`{prop_name}` = ${param_name}") # Use backticks for safety
+                params[param_name] = prop_value
+
+        return " AND ".join(filter_clauses) if filter_clauses else ""
 
 
     async def node_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EntityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Using case-insensitive CONTAINS as a basic FTS.
-        # For true FTS, Kuzu might require specific indexing (e.g., Lucene extension) and query syntax.
+        # Current FTS uses case-insensitive CONTAINS, offering basic substring matching.
+        # For advanced FTS (e.g., stemming, ranking, specific operators), KuzuDB might offer
+        # dedicated FTS indexing (e.g., via extensions) and query functions, which should be preferred if available.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
         
         where_clauses = ["(CONTAINS(lower(n.name), $query_str_lower) OR CONTAINS(lower(n.summary), $query_str_lower))"]
@@ -534,10 +597,10 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def node_similarity_search(self, search_vector: List[float], search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[EntityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Kuzu's vector similarity function might be list_similarity for dot product, or a specific cosine_similarity.
-        # Assuming cosine_similarity for now as it's common. This needs to match Kuzu's actual function.
-        # If an HNSW index exists, query might be different: `LOAD FROM SCAN(Entity knn_scan('name_embedding', $search_vector, $limit))`
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder
+        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
+        # Common examples: list_similarity(a, b), cosine_distance(a,b), etc.
+        # Adjust the function name and potentially the scoring (distance vs similarity) as needed.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
         
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         where_clauses = [f"{KUZU_SIMILARITY_FUNCTION}(n.name_embedding, $s_vec) >= $min_s"]
@@ -560,8 +623,9 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def edge_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EntityEdge]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
+        # Current FTS uses case-insensitive CONTAINS. See node_fulltext_search for notes on advanced FTS.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
-        
+
         # Assuming EntityEdges are of type RELATES_TO and connect Entity nodes
         # Searching on 'name' and 'fact' properties of the edge
         where_clauses = ["(CONTAINS(lower(r.name), $query_str_lower) OR CONTAINS(lower(r.fact), $query_str_lower))"]
@@ -619,13 +683,28 @@ class KuzuDBProvider(GraphDatabaseProvider):
         entity_edges: List[EntityEdge],
         embedder: EmbedderClient
     ) -> None:
+        """
+        Adds nodes and edges in bulk to KuzuDB.
+        This implementation uses KuzuDB's `COPY FROM` command with Parquet files for efficiency.
+        It involves serializing Pydantic objects to pandas DataFrames, writing to temporary
+        Parquet files, and then using `COPY FROM`.
+        Embeddings are generated for nodes/edges if not present before bulk loading.
+        Nodes are upserted using `ON CONFLICT DO UPDATE` with `COPY`.
+        Relationships are appended.
+        Requires `pandas` and `pyarrow` (for Parquet) to be installed.
+        """
         if not self.connection:
             raise ConnectionError("KuzuDB connection not established.")
 
-        logger.info(f"Starting KuzuDB bulk add: {len(episodic_nodes)} episodic, {len(entity_nodes)} entity, {len(CommunityNode)} community nodes; {len(episodic_edges)} episodic, {len(entity_edges)} entity, {len(CommunityEdge)} community edges.")
+        logger.info(f"Starting KuzuDB bulk add: {len(episodic_nodes)} episodic, {len(entity_nodes)} entity nodes; {len(episodic_edges)} episodic, {len(entity_edges)} entity edges.")
 
         # Required imports for COPY FROM approach
-        import pandas as pd
+        try:
+            import pandas as pd
+        except ImportError:
+            logger.error("Pandas library is required for KuzuDB bulk operations but not installed.")
+            raise ImportError("Pandas library is required for KuzuDB bulk operations.")
+
         import tempfile
         import os
 
@@ -634,31 +713,25 @@ class KuzuDBProvider(GraphDatabaseProvider):
             if df.empty:
                 logger.info(f"No data to load for table {table_name}.")
                 return
-            
-            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpfile:
-                tmpfile_path = tmpfile.name
-            
+
+            # Ensure temp file is created and handled correctly, especially with 'delete=False'
+            fd, tmpfile_path = tempfile.mkstemp(suffix=".parquet")
+            os.close(fd) # Close the file descriptor, as to_parquet will open/write to the path
+
             try:
                 df.to_parquet(tmpfile_path)
-                
-                # For node tables with Primary Keys, use ON CONFLICT DO UPDATE
-                # This requires listing all columns to update.
-                # Example: COPY Entity FROM 'entity_nodes.parquet' (FORMAT 'parquet', ON_CONFLICT_DO_UPDATE_SET = [name, group_id, ...]);
-                # Kuzu syntax for ON CONFLICT for COPY is actually: COPY Entity FROM 'file.parquet' (ON_CONFLICT (uuid) DO UPDATE SET name = excluded.name, ...);
-                # Or simpler if Kuzu allows generic update: COPY Entity FROM 'file.parquet' (ON_CONFLICT (uuid) DO UPDATE); -> this is not standard SQL.
-                # Kuzu's documentation for COPY states:
-                # COPY NodeTable FROM "node_file.parquet" (ON_CONFLICT (pk_property_name) DO UPDATE SET property1=EXCLUDED.property1, ...)
-                # COPY RelTable FROM "rel_file.parquet"
-                
+
                 copy_options = ""
                 if node_table: # Nodes have PK (uuid)
-                    update_cols = [col for col in df.columns if col != "uuid"] # Don't update PK itself
+                    update_cols = [col for col in df.columns if col != "uuid"]
                     if update_cols:
                         set_clauses = ", ".join([f"{col}=EXCLUDED.{col}" for col in update_cols])
+                        # Kuzu's ON CONFLICT syntax for COPY: (key_column_name) DO UPDATE SET ...
                         copy_options = f"(ON_CONFLICT (uuid) DO UPDATE SET {set_clauses})"
-                    else: # Only uuid column, effectively ON CONFLICT DO NOTHING
+                    else:
                         copy_options = f"(ON_CONFLICT (uuid) DO NOTHING)"
 
+                # Ensure file path is properly escaped/quoted for Cypher, though Kuzu usually handles local paths well.
                 query = f"COPY {table_name} FROM '{tmpfile_path}' {copy_options}"
                 logger.debug(f"Executing Kuzu COPY: {query}")
                 await self.execute_query(query)
@@ -668,10 +741,13 @@ class KuzuDBProvider(GraphDatabaseProvider):
                 raise
             finally:
                 if os.path.exists(tmpfile_path):
-                    os.remove(tmpfile_path)
+                    try:
+                        os.remove(tmpfile_path)
+                    except Exception as e_remove:
+                        logger.error(f"Error removing temporary Kuzu COPY file {tmpfile_path}: {e_remove}")
 
-        # 1. Embedding Generation (as in existing logic)
-        logger.info("Generating embeddings...")
+        # 1. Embedding Generation
+        logger.info("Generating embeddings for KuzuDB bulk load...")
         # Entity Nodes
         for node in entity_nodes:
             if node.name_embedding is None and hasattr(node, 'name') and node.name:
@@ -778,16 +854,16 @@ class KuzuDBProvider(GraphDatabaseProvider):
     async def count_node_mentions(self, node_uuid: str) -> int:
         if not self.connection:
             raise ConnectionError("KuzuDB connection not established.")
-        
+
         # Kuzu Cypher for counting distinct incoming relationships from Episodic nodes via MENTIONS
         # Assuming MENTIONS is defined as (Episodic)-[MENTIONS]->(Entity)
         query = """
             MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid: $node_uuid})
-            RETURN count(DISTINCT e.uuid) AS mention_count 
+            RETURN count(DISTINCT e.uuid) AS mention_count
         """
         # Kuzu might prefer count(e) or count(*) if e is guaranteed distinct by the match pattern for this purpose.
         # Using count(DISTINCT e.uuid) for clarity that we want distinct episodic nodes.
-        
+
         results, _, _ = await self.execute_query(query, params={"node_uuid": node_uuid})
         if results and results[0] and "mention_count" in results[0]:
             # Ensure the count is an integer
@@ -800,12 +876,13 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def edge_similarity_search(self, search_vector: List[float], source_node_uuid: Optional[str], target_node_uuid: Optional[str], search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[EntityEdge]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Assuming Kuzu's vector similarity function is 'cosine_similarity'. This needs to be verified.
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" 
-        
+        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
+
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         match_clauses = ["MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)"]
-        where_clauses = [f"{KUZU_SIMILARITY_FUNCTION}(r.fact_embedding, $s_vec) >= $min_s"]
+        # Ensure fact_embedding is not null before calling similarity function
+        where_clauses = ["r.fact_embedding IS NOT NULL", f"{KUZU_SIMILARITY_FUNCTION}(r.fact_embedding, $s_vec) >= $min_s"]
 
         if source_node_uuid:
             where_clauses.append("s.uuid = $source_uuid")
@@ -816,12 +893,12 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if group_ids:
             where_clauses.append("r.group_id IN $gids") # Assuming edges can have group_ids
             params["gids"] = group_ids
-        
+
         # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, edge_alias="r")
 
         return_cols = "r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, s.uuid as source_node_uuid, t.uuid as target_node_uuid"
         final_query = f"{' '.join(match_clauses)} WHERE {' AND '.join(where_clauses)} RETURN {return_cols}, {KUZU_SIMILARITY_FUNCTION}(r.fact_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
-        
+
         try:
             results, _, _ = await self.execute_query(final_query, params)
             return [self._kuzudb_to_entity_edge(res) for res in results]
@@ -846,28 +923,38 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if search_filter and search_filter.edge_types:
             # Example: search_filter.edge_types = ["RELATES_TO", "MENTIONS"] -> ":RELATES_TO|MENTIONS"
             edge_type_str = ":" + "|".join(search_filter.edge_types)
-        
+
         # This query returns a list of relationships for each path. We need to flatten and unique them.
         # Simpler: Collect distinct edges found in paths up to max_depth.
         query = f"""
         MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
         WHERE origin.uuid IN $origin_uuids
         UNWIND rels AS r // Unwind the list of relationships in each path
-        // TODO: Apply search_filter to properties of 'r' if necessary here
-        RETURN DISTINCT r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, 
+        WITH origin, peer, r // Make r, peer, origin available for filtering
+        // Apply search_filter to properties of 'r' (edge)
+        // And potentially to 'peer' (target node of the edge in path) or 'origin'
+        // This example applies filters to 'r'.
+        // The _apply_search_filters_to_query_basic needs params dict to add its parameters
+        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
+        additional_where_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+
+        final_where_clause = "WHERE " + additional_where_clauses_str if additional_where_clauses_str else ""
+
+        query = f"""
+        MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
+        WHERE origin.uuid IN $origin_uuids
+        UNWIND rels AS r
+        WITH origin, peer, r // Expose r for filtering
+        {final_where_clause} // Apply filters on r
+        RETURN DISTINCT r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes,
                        r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes,
                        startNode(r).uuid AS source_node_uuid, endNode(r).uuid AS target_node_uuid
         LIMIT $lim
         """
-        # Note: The relationship type for 'r' is implicitly EntityEdge (RELATES_TO) due to (Entity)-[]->(Entity)
-        # If other edge types are needed, the MATCH pattern and RETURN parsing need to be more generic.
-        # For now, assuming EntityEdge / RELATES_TO based on typical BFS use cases.
-        # If search_filter.edge_types was used in edge_type_str, Kuzu might not allow property access on 'r' directly
-        # if 'r' can be of multiple types with different properties.
+        # Note: The relationship type for 'r' is implicitly EntityEdge (RELATES_TO) due to (Entity)-[]->(Entity) pattern.
+        # If search_filter.edge_types was used in path pattern, this filtering on 'r' assumes properties common to those types.
         # The current RETURN statement assumes 'r' has EntityEdge properties.
-        
-        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
-        
+
         try:
             results, _, _ = await self.execute_query(query, params)
             # Filter out results where r might be null if path is just one node (should not happen with *1..N)
@@ -884,19 +971,27 @@ class KuzuDBProvider(GraphDatabaseProvider):
         edge_type_str = "*"
         if search_filter and search_filter.edge_types:
             edge_type_str = ":" + "|".join(search_filter.edge_types)
-        
+
         # Collect distinct peer nodes found in paths up to max_depth
-        # The origin nodes themselves are not part of the result unless they are also peers.
+        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
+        # Apply search_filter to properties of 'peer' (target node)
+        additional_where_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "peer", params)
+
+        # Base WHERE clause for BFS logic (origin filtering, distinct from peer)
+        base_where_clauses = ["origin.uuid IN $origin_uuids", "origin.uuid <> peer.uuid"]
+
+        if additional_where_clauses_str:
+            base_where_clauses.append(additional_where_clauses_str)
+
+        final_where_clause = "WHERE " + " AND ".join(base_where_clauses)
+
         query = f"""
         MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
-        WHERE origin.uuid IN $origin_uuids AND origin.uuid <> peer.uuid 
-        // TODO: Apply search_filter to properties of 'peer' if necessary here
+        {final_where_clause}
         RETURN DISTINCT peer.uuid, peer.name, peer.group_id, peer.created_at, peer.summary, peer.name_embedding, peer.attributes
         LIMIT $lim
         """
-        # Assuming peer is EntityNode. If search_filter.node_labels specified other types, this needs adjustment.
-
-        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
+        # Assuming peer is EntityNode. If search_filter.node_labels specified other types, MATCH pattern would need change.
 
         try:
             results, _, _ = await self.execute_query(query, params)
@@ -907,16 +1002,17 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def episode_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EpisodicNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
+        # Current FTS uses case-insensitive CONTAINS. See node_fulltext_search for notes on advanced FTS.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
-        
+
         # Searching on 'name' and 'content' properties of EpisodicNode
         where_clauses = ["(CONTAINS(lower(e.name), $query_str_lower) OR CONTAINS(lower(e.content), $query_str_lower) OR CONTAINS(lower(e.source_description), $query_str_lower))"]
         if group_ids:
             where_clauses.append("e.group_id IN $gids")
             params["gids"] = group_ids
-        
+
         # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="e")
-        
+
         cols = "e.uuid, e.name, e.group_id, e.source, e.source_description, e.content, e.valid_at, e.created_at, e.entity_edges"
         final_query = f"MATCH (e:Episodic) WHERE {' AND '.join(where_clauses)} RETURN {cols} LIMIT $limit_val"
         results, _, _ = await self.execute_query(final_query, params)
@@ -924,16 +1020,17 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def community_fulltext_search(self, query: str, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[CommunityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
+        # Current FTS uses case-insensitive CONTAINS. See node_fulltext_search for notes on advanced FTS.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
-        
+
         # Searching on 'name' and 'summary' properties of CommunityNode
         where_clauses = ["(CONTAINS(lower(c.name), $query_str_lower) OR CONTAINS(lower(c.summary), $query_str_lower))"]
         if group_ids:
             where_clauses.append("c.group_id IN $gids")
             params["gids"] = group_ids
-        
+
         # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="c") # search_filter not passed here
-        
+
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols} LIMIT $limit_val"
         results, _, _ = await self.execute_query(final_query, params)
@@ -941,19 +1038,21 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def community_similarity_search(self, search_vector: List[float], group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[CommunityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder, verify Kuzu's function
-        
+        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
+
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
-        where_clauses = [f"{KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) >= $min_s"]
+        # Ensure name_embedding is not null
+        where_clauses = ["c.name_embedding IS NOT NULL", f"{KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) >= $min_s"]
         if group_ids:
             where_clauses.append("c.group_id IN $gids")
             params["gids"] = group_ids
-        
+
         # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="c") # search_filter not passed here
 
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols}, {KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
-        
+
         try:
             results, _, _ = await self.execute_query(final_query, params)
             return [self._kuzudb_to_community_node(res) for res in results]
@@ -967,7 +1066,7 @@ class KuzuDBProvider(GraphDatabaseProvider):
         # For now, iterate and call node_similarity_search for each node's embedding if available.
         # search_filter and min_score apply to the similarity search.
         if not self.connection or not nodes: return []
-        
+
         all_relevant_nodes: List[List[EntityNode]] = []
         for node in nodes:
             if node.name_embedding:
@@ -978,7 +1077,7 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
                     similar_nodes = await self.node_similarity_search(
                         search_vector=node.name_embedding,
-                        search_filter=search_filter, 
+                        search_filter=search_filter,
                         group_ids=group_ids_filter, # Or from search_filter
                         limit=limit,
                         min_score=min_score
@@ -1003,7 +1102,7 @@ class KuzuDBProvider(GraphDatabaseProvider):
                 try:
                     group_ids_filter = [edge.group_id] if edge.group_id else None
                     # TODO: Refine group_ids_filter
-                    
+
                     similar_edges = await self.edge_similarity_search(
                         search_vector=edge.fact_embedding,
                         source_node_uuid=None, # Or edge.source_node_uuid if context matters
@@ -1022,12 +1121,33 @@ class KuzuDBProvider(GraphDatabaseProvider):
         return all_relevant_edges
 
     async def get_edge_invalidation_candidates(self, edges: List[EntityEdge], search_filter: SearchFilters, min_score: float, limit: int) -> List[List[EntityEdge]]:
+        """
+        Identifies entity edges that are candidates for invalidation based on relevance or other criteria.
+
+        NOTE: This is currently a placeholder implementation and mirrors `get_relevant_edges`.
+        The logic for determining "invalidation candidates" is typically domain-specific and
+        would require a more tailored implementation based on specific business rules
+        (e.g., edges that are old, have low usage, conflict with new information, etc.).
+
+        Parameters:
+            edges: A list of reference EntityEdge objects.
+            search_filter: SearchFilters to apply.
+            min_score: Minimum similarity score for an edge to be considered relevant (if using similarity).
+            limit: Maximum number of candidate edges to return per input edge.
+
+        Returns:
+            A list of lists, where each inner list contains candidate EntityEdge objects
+            for invalidation related to the corresponding input edge.
+        """
+        logger.warning(
+            "get_edge_invalidation_candidates is using get_relevant_edges logic as a placeholder. "
+            "Define specific business logic for invalidation candidates if needed."
+        )
         # Placeholder: "Invalidation candidates" is domain-specific.
-        # A generic approach could be to find edges that are "semantically distant" 
+        # A generic approach could be to find edges that are "semantically distant"
         # from a set of reference edges, or perhaps edges whose connected nodes have changed significantly.
-        # This implementation will be identical to get_relevant_edges but conceptually it's different.
-        # True implementation would need more business logic definition.
-        logger.warning("get_edge_invalidation_candidates is using get_relevant_edges logic as a placeholder.")
+        # This implementation currently mirrors get_relevant_edges.
+        # A more specific implementation would depend on the exact criteria for "invalidation".
         return await self.get_relevant_edges(edges, search_filter, min_score, limit)
 
     async def add_nodes_and_edges_bulk(

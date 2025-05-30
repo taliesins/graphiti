@@ -64,12 +64,14 @@ class Edge(BaseModel, ABC):
     created_at: datetime
 
     @abstractmethod
-    async def save(self, provider: GraphDatabaseProvider): ... # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current edge instance to the database using the provided provider."""
+        pass
 
-    async def delete(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def delete(self, provider: GraphDatabaseProvider):
+        """Deletes the current edge instance from the database using the provided provider."""
         await provider.delete_edge(self.uuid) # Delegate to provider
         logger.debug(f'Deleted Edge: {self.uuid} via provider')
-        # Return value might change based on provider.delete_edge signature, assuming None for now
         return None
 
     def __hash__(self):
@@ -81,33 +83,39 @@ class Edge(BaseModel, ABC):
         return False
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): ... # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str):
+        """Retrieves an edge of this type by its UUID using the provided provider."""
+        pass
 
 
 class EpisodicEdge(Edge):
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current EpisodicEdge instance using the provided provider."""
         logger.debug(f'Saving EpisodicEdge: {self.uuid} via provider')
-        return await provider.save_episodic_edge(self) # Delegate to provider
+        return await provider.save_episodic_edge(self)
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "EpisodicEdge":
+        """Retrieves an EpisodicEdge by its UUID using the provided provider."""
         edge = await provider.get_episodic_edge_by_uuid(uuid)
         if not edge:
             raise EdgeNotFoundError(uuid)
         return edge
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["EpisodicEdge"]:
+        """Retrieves multiple EpisodicEdges by their UUIDs using the provided provider."""
         return await provider.get_episodic_edges_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
+    ) -> List["EpisodicEdge"]:
+        """Retrieves EpisodicEdges by group IDs using the provided provider."""
         return await provider.get_episodic_edges_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
@@ -156,19 +164,22 @@ class EntityEdge(Edge):
                 raise EdgeNotFoundError(self.uuid)
 
 
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current EntityEdge instance using the provided provider."""
         logger.debug(f'Saving EntityEdge: {self.uuid} via provider')
-        return await provider.save_entity_edge(self) # Delegate to provider
+        return await provider.save_entity_edge(self)
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "EntityEdge":
+        """Retrieves an EntityEdge by its UUID using the provided provider."""
         edge = await provider.get_entity_edge_by_uuid(uuid)
         if not edge:
             raise EdgeNotFoundError(uuid)
         return edge
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["EntityEdge"]:
+        """Retrieves multiple EntityEdges by their UUIDs using the provided provider."""
         if not uuids: 
             return []
         return await provider.get_entity_edges_by_uuids(uuids)
@@ -176,52 +187,59 @@ class EntityEdge(Edge):
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
+    ) -> List["EntityEdge"]:
+        """Retrieves EntityEdges by group IDs using the provided provider."""
         return await provider.get_entity_edges_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
 
     @classmethod
-    async def get_by_node_uuid(cls, provider: GraphDatabaseProvider, node_uuid: str): # Changed driver to provider
+    async def get_by_node_uuid(cls, provider: GraphDatabaseProvider, node_uuid: str) -> List["EntityEdge"]:
+        """Retrieves EntityEdges connected to a given node UUID using the provided provider."""
         return await provider.get_entity_edges_by_node_uuid(node_uuid)
 
 
 class CommunityEdge(Edge):
-    async def save(self, provider: GraphDatabaseProvider): # Changed driver to provider
+    async def save(self, provider: GraphDatabaseProvider):
+        """Saves the current CommunityEdge instance using the provided provider."""
         logger.debug(f'Saving CommunityEdge: {self.uuid} via provider')
-        return await provider.save_community_edge(self) # Delegate to provider
+        return await provider.save_community_edge(self)
 
     @classmethod
-    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str): # Changed driver to provider
+    async def get_by_uuid(cls, provider: GraphDatabaseProvider, uuid: str) -> "CommunityEdge":
+        """Retrieves a CommunityEdge by its UUID using the provided provider."""
         edge = await provider.get_community_edge_by_uuid(uuid)
         if not edge: 
             raise EdgeNotFoundError(uuid)
         return edge
 
     @classmethod
-    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]): # Changed driver to provider
+    async def get_by_uuids(cls, provider: GraphDatabaseProvider, uuids: list[str]) -> List["CommunityEdge"]:
+        """Retrieves multiple CommunityEdges by their UUIDs using the provided provider."""
         return await provider.get_community_edges_by_uuids(uuids)
 
     @classmethod
     async def get_by_group_ids(
         cls,
-        provider: GraphDatabaseProvider, # Changed driver to provider
+        provider: GraphDatabaseProvider,
         group_ids: list[str],
         limit: int | None = None,
         uuid_cursor: str | None = None,
-    ):
+    ) -> List["CommunityEdge"]:
+        """Retrieves CommunityEdges by group IDs using the provided provider."""
         return await provider.get_community_edges_by_group_ids(
             group_ids=group_ids, limit=limit, uuid_cursor=uuid_cursor
         )
 
 
 # Edge helpers
-# These helpers are primarily used by Neo4jProvider now.
-# They might be moved to the provider module or a shared parsing utility later.
+# These helpers are primarily used by Neo4jProvider for parsing raw query results.
+# Other providers (like KuzuDBProvider) might have their own internal parsing methods
+# that directly construct Pydantic models.
 def get_episodic_edge_from_record(record: Any) -> EpisodicEdge:
     return EpisodicEdge(
         uuid=record['uuid'],
@@ -277,12 +295,14 @@ def get_community_edge_from_record(record: Any) -> CommunityEdge:
 
 
 async def create_entity_edge_embeddings(embedder: EmbedderClient, edges: list[EntityEdge]):
-    # This utility function might be better placed elsewhere or used by providers internally.
-    if len(edges) == 0:
+    # This utility function is primarily called by Graphiti class or other high-level logic
+    # before passing edges to a provider's bulk save operation, or for ad-hoc embedding.
+    # It operates on Pydantic model instances directly.
+    if not edges: # Check if the list is empty
         return
     fact_embeddings_list = await embedder.create_batch([edge.fact for edge in edges])
     for edge, fact_embedding_item in zip(edges, fact_embeddings_list, strict=True):
-        # Assuming create_batch returns a list of embeddings (List[List[float]])
-        # and each item is the embedding for the corresponding edge.
+        # Assuming create_batch returns a list of embeddings (List[List[float]]),
+        # and each item in that list is an embedding for the corresponding edge.
         edge.fact_embedding = fact_embedding_item
 ```
