@@ -368,3 +368,8 @@ class GraphDatabaseProvider(ABC):
         Raises an exception if connectivity cannot be verified.
         """
         pass
+
+    @abstractmethod
+    async def count_node_mentions(self, node_uuid: str) -> int:
+        """Counts how many distinct episodes mention a given entity node."""
+        pass

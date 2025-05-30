@@ -170,6 +170,8 @@ RELEVANT_SCHEMA_LIMIT = 10
 DEFAULT_MIN_SCORE = 0.6
 MAX_QUERY_LENGTH = 32 # Max terms for lucene query
 
+EPISODE_WINDOW_LEN = 3 # Moved from graph_data_operations.py
+
 # Helper for fulltext query construction (adapted from search_utils)
 def _fulltext_lucene_query(query: str, group_ids: Optional[List[str]] = None) -> str:
     group_ids_filter_list = (
@@ -259,20 +261,28 @@ class Neo4jProvider(GraphDatabaseProvider):
 
 
     async def build_indices_and_constraints(self, delete_existing: bool = False) -> None:
+        # Logic from graphiti_core.utils.maintenance.graph_data_operations.build_indices_and_constraints
         if not self.driver:
             raise ConnectionError("Driver not initialized. Call connect() first.")
 
         if delete_existing:
             records, _, _ = await self.execute_query(
-                "SHOW INDEXES YIELD name"
+                "SHOW INDEXES YIELD name",
+                database_=self.database # Use provider's database
             )
             index_names = [record['name'] for record in records]
-            # TODO: Consider semaphore_gather if there are many indices, though it might be overkill here
-            for name in index_names:
-                await self.execute_query("DROP INDEX $name", params={"name": name})
-            logger.info("Deleted existing indices.")
-        
-        # Adapted from graphiti_core.utils.maintenance.graph_data_operations
+            await semaphore_gather(
+                *[
+                    self.execute_query(
+                        "DROP INDEX $name",
+                        params={"name": name}, # Query params should be in 'params'
+                        database_=self.database,
+                    )
+                    for name in index_names
+                ]
+            )
+            logger.info("Deleted existing Neo4j indices.")
+
         range_indices: list[LiteralString] = [
             'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
             'CREATE INDEX episode_uuid IF NOT EXISTS FOR (n:Episodic) ON (n.uuid)',
@@ -308,13 +318,16 @@ class Neo4jProvider(GraphDatabaseProvider):
 
         index_queries: list[LiteralString] = range_indices + fulltext_indices
 
-        # Using semaphore_gather from helpers, assuming it's appropriate here
         await semaphore_gather(
             *[
-                self.execute_query(query) for query in index_queries
+                self.execute_query(
+                    query,
+                    database_=self.database,
+                )
+                for query in index_queries
             ]
         )
-        logger.info("Built indices and constraints.")
+        logger.info("Built Neo4j indices and constraints.")
 
     # CRUD Operations for Nodes
     async def save_episodic_node(self, node: EpisodicNode) -> Any:
@@ -833,41 +846,46 @@ class Neo4jProvider(GraphDatabaseProvider):
 
     # Maintenance/Utility
     async def clear_data(self, group_ids: Optional[List[str]] = None) -> None:
-        # Adapted from graphiti_core.utils.maintenance.graph_data_operations.clear_data
-        # Uses execute_write which is session-specific. Here we use execute_query.
-        # Neo4j Python driver's execute_query can handle writes.
-        # For explicit transaction control, one would use a session.
-        
-        if group_ids is None:
-            # Delete all data in the current database
-            # This is a dangerous operation, ensure it's what's intended.
-            # The original code used a session and tx.run('MATCH (n) DETACH DELETE n')
-            await self.execute_query('MATCH (n) DETACH DELETE n')
-            logger.info(f"Cleared all data from database {self.database}")
-        else:
-            # Delete data for specific group_ids
-            # The original query was 'MATCH (n:Entity|Episodic|Community) WHERE n.group_id IN $group_ids DETACH DELETE n'
-            # This targets specific node types. A more general approach might be:
-            # 'MATCH (n) WHERE n.group_id IN $group_ids DETACH DELETE n'
-            # For now, sticking to the more specific node types as in original:
-            await self.execute_query(
-                'MATCH (n) WHERE n.group_id IN $group_ids DETACH DELETE n',
-                # Original was specific: (n:Entity|Episodic|Community)
-                # 'MATCH (n:Entity|Episodic|Community) WHERE n.group_id IN $group_ids DETACH DELETE n',
-                params={"group_ids": group_ids},
-            )
-            logger.info(f"Cleared data for group_ids: {group_ids} from database {self.database}")
+        # Logic from graphiti_core.utils.maintenance.graph_data_operations.clear_data
+        if not self.driver:
+            raise ConnectionError("Driver not initialized. Call connect() first.")
 
+        async with self.get_session() as session: # Use self.get_session()
+            async def delete_all(tx):
+                # Using self.database which is the configured database for the provider
+                await tx.run('MATCH (n) DETACH DELETE n')
+                logger.info(f"Cleared all data from database {self.database}")
+
+            async def delete_group_ids(tx, group_ids_to_delete: list[str]):
+                await tx.run(
+                    # Original query was 'MATCH (n:Entity|Episodic|Community) WHERE n.group_id IN $group_ids DETACH DELETE n'
+                    # Making it slightly more generic by not specifying labels, or assume group_id is only on these labels.
+                    # For safety, let's use the specific labels if that was the original intent.
+                    'MATCH (n) WHERE n.group_id IN $group_ids DETACH DELETE n',
+                    # 'MATCH (n:Entity|Episodic|Community) WHERE n.group_id IN $group_ids DETACH DELETE n',
+                    group_ids=group_ids_to_delete,
+                )
+                logger.info(f"Cleared data for group_ids: {group_ids_to_delete} from database {self.database}")
+
+            if group_ids is None:
+                await session.execute_write(delete_all)
+            else:
+                if not group_ids: # Handle empty list case if necessary
+                    logger.info("No group_ids provided for selective clear, no data deleted.")
+                    return
+                await session.execute_write(delete_group_ids, group_ids_to_delete=group_ids)
 
     async def retrieve_episodes(
         self,
         reference_time: datetime,
-        last_n: int = EPISODE_WINDOW_LEN, # Default from original file
+        last_n: int = EPISODE_WINDOW_LEN, 
         group_ids: Optional[List[str]] = None,
         source: Optional[EpisodeType] = None,
     ) -> List[EpisodicNode]:
-        # Adapted from graphiti_core.utils.maintenance.graph_data_operations.retrieve_episodes
-        
+        # Logic from graphiti_core.utils.maintenance.graph_data_operations.retrieve_episodes
+        if not self.driver:
+            raise ConnectionError("Driver not initialized. Call connect() first.")
+
         group_id_filter_clause: LiteralString = (
             '\nAND e.group_id IN $group_ids' if group_ids and len(group_ids) > 0 else ''
         )
@@ -894,37 +912,24 @@ class Neo4jProvider(GraphDatabaseProvider):
         
         params = {
             "reference_time": reference_time,
-            "source_val": source.value if source is not None else None,
+            "source_val": source.value if source is not None else None, # Use .value for enum
             "num_episodes": last_n,
             "group_ids": group_ids,
         }
-        params = {k: v for k,v in params.items() if v is not None or k == "group_ids" and group_ids is not None}
+        # Filter out None params only if the query part is conditional and not present
+        # Here, group_ids = None and source_val = None are fine if clauses are absent
+        final_params = {k: v for k, v in params.items() if v is not None or (k == "group_ids" and group_ids is not None)}
 
 
-        records, _, _ = await self.execute_query(query, params=params)
+        records, _, _ = await self.execute_query(query, params=final_params, database_=self.database)
         
-        # The original record parsing for EpisodicNode:
-        # EpisodicNode(
-        #     content=record['content'],
-        #     created_at=datetime.fromtimestamp(record['created_at'].to_native().timestamp(), timezone.utc),
-        #     valid_at=(record['valid_at'].to_native()),
-        #     uuid=record['uuid'],
-        #     group_id=record['group_id'],
-        #     source=EpisodeType.from_str(record['source']),
-        #     name=record['name'],
-        #     source_description=record['source_description'],
-        # )
-        # The get_episodic_node_from_record in graphiti_core.nodes.py handles this.
-        # However, it has `created_at=record['created_at'].to_native().timestamp()` which is float.
-        # EpisodicNode expects datetime for created_at. This needs alignment.
-        # For now, I'll use get_episodic_node_from_record and assume it's correct or will be fixed.
-
+        # Using get_episodic_node_from_record which should handle Neo4j specific datetime objects.
+        # It's defined in graphiti_core.nodes
         episodes = [get_episodic_node_from_record(record) for record in records]
         return list(reversed(episodes))  # Return in chronological order
 
-
     # --------------------------------------------------------------------------
-    # Abstract methods from GraphDatabaseProvider to be implemented later (Search & Bulk)
+    # Search and Bulk methods that were previously here (or stubs)
     # --------------------------------------------------------------------------
 
     # Search Operations (Implementations adapted from graphiti_core.search.search_utils)
@@ -1615,6 +1620,21 @@ class Neo4jProvider(GraphDatabaseProvider):
 
         return [all_invalidation_candidates_map.get(edge.uuid, []) for edge in edges]
 
+    async def count_node_mentions(self, node_uuid: str) -> int:
+        if not self.driver:
+            raise ConnectionError("Driver not initialized. Call connect() first.")
+        
+        # This query counts distinct episodic nodes that mention the given entity node.
+        # It assumes the relationship is (:Episodic)-[:MENTIONS]->(:Entity)
+        query = """
+            MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid: $node_uuid})
+            RETURN count(DISTINCT e) AS mention_count
+        """
+        records, _, _ = await self.execute_query(query, params={"node_uuid": node_uuid}, database_=self.database)
+        if records and records[0] and "mention_count" in records[0]:
+            return int(records[0]["mention_count"])
+        return 0
+
 # Internal helper for adding group_id filter clause if group_ids are provided
 def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
     if group_ids:
@@ -1623,3 +1643,153 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
 
 # (Previous code for CRUD, Connection, etc. remains unchanged)
 # ...
+
+    async def add_nodes_and_edges_bulk(
+        self,
+        episodic_nodes: List[EpisodicNode],
+        episodic_edges: List[EpisodicEdge],
+        entity_nodes: List[EntityNode],
+        entity_edges: List[EntityEdge],
+        embedder: EmbedderClient
+    ) -> None:
+        if not self.driver:
+            raise ConnectionError("Driver not initialized. Call connect() first.")
+
+        # This internal transaction function mirrors the logic from the old
+        # bulk_utils.add_nodes_and_edges_bulk_tx
+        async def _add_nodes_and_edges_bulk_tx(
+            tx: AsyncManagedTransaction, # Comes from Neo4j driver
+            ep_nodes: List[EpisodicNode],
+            ep_edges: List[EpisodicEdge],
+            en_nodes: List[EntityNode],
+            en_edges: List[EntityEdge],
+            emb_client: EmbedderClient,
+        ):
+            # Prepare EpisodicNode data
+            episodes_data = []
+            for episode_node in ep_nodes:
+                data = episode_node.model_dump(exclude_none=False) # Use exclude_none=False to include nulls if schema expects them
+                data['source'] = str(episode_node.source.value) # Ensure enum is string
+                # Ensure all schema fields are present for Cypher query
+                for key in ['uuid', 'name', 'group_id', 'source', 'source_description', 'content', 'valid_at', 'created_at', 'entity_edges']:
+                    data.setdefault(key, None)
+                if data['entity_edges'] is None: data['entity_edges'] = []
+                episodes_data.append(data)
+
+            # Prepare EntityNode data and generate embeddings
+            entity_nodes_data = []
+            for node in en_nodes:
+                if node.name_embedding is None and hasattr(node, 'name') and node.name:
+                    # Assuming node.generate_name_embedding is not an async function directly
+                    # If it were, this would need to be done outside the tx or use an async embedder call
+                    # For now, adapting the structure where embedding generation was part of the tx function body in bulk_utils
+                    # This implies that embedder.create might be blocking if called like this.
+                    # Ideally, embeddings are generated before this tx function.
+                    # The original code called `await node.generate_name_embedding(embedder)`
+                    # which suggests it was async. This means it should be done *before* starting the transaction,
+                    # or the embedder client itself needs to be async and used with await.
+                    # For this refactoring, I'll keep the await, assuming embedder client is async.
+                    text_to_embed = node.name.replace('\n', ' ') # From Kuzu provider bulk
+                    embedding_result = await emb_client.create(input_data=[text_to_embed])
+                    if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                         node.name_embedding = embedding_result[0]
+
+                entity_data: dict[str, Any] = {
+                    'uuid': node.uuid,
+                    'name': node.name,
+                    'name_embedding': node.name_embedding,
+                    'group_id': node.group_id,
+                    'summary': node.summary,
+                    'created_at': node.created_at,
+                }
+                # Add attributes and ensure labels are correctly formatted
+                entity_data.update(node.attributes or {})
+                # The ENTITY_NODE_SAVE_BULK query expects $labels to be a list of strings.
+                entity_data['labels'] = list(set(node.labels + ['Entity']))
+                entity_nodes_data.append(entity_data)
+
+            # Prepare EntityEdge data and generate embeddings
+            entity_edges_data = []
+            for edge in en_edges:
+                if edge.fact_embedding is None and hasattr(edge, 'fact') and edge.fact:
+                    text_to_embed = edge.fact.replace('\n', ' ') # From Kuzu provider bulk
+                    embedding_result = await emb_client.create(input_data=[text_to_embed])
+                    if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                        edge.fact_embedding = embedding_result[0]
+                
+                edge_data: dict[str, Any] = {
+                    'uuid': edge.uuid,
+                    'source_node_uuid': edge.source_node_uuid, # Used by query to MATCH source
+                    'target_node_uuid': edge.target_node_uuid, # Used by query to MATCH target
+                    'name': edge.name,
+                    'fact': edge.fact,
+                    'fact_embedding': edge.fact_embedding,
+                    'group_id': edge.group_id,
+                    'episodes': edge.episodes,
+                    'created_at': edge.created_at,
+                    'expired_at': edge.expired_at,
+                    'valid_at': edge.valid_at,
+                    'invalid_at': edge.invalid_at,
+                }
+                edge_data.update(edge.attributes or {})
+                if edge_data['episodes'] is None: edge_data['episodes'] = []
+                entity_edges_data.append(edge_data)
+            
+            # Prepare EpisodicEdge data
+            # EPISODIC_EDGE_SAVE_BULK expects a list of dicts, each dict being edge.model_dump()
+            episodic_edges_prepared_data = []
+            for ep_edge in ep_edges:
+                data = ep_edge.model_dump(exclude_none=False)
+                # Ensure all schema fields are present for Cypher query
+                for key in ['uuid', 'source_node_uuid', 'target_node_uuid', 'group_id', 'created_at']:
+                    data.setdefault(key, None)
+                episodic_edges_prepared_data.append(data)
+
+
+            # Execute bulk queries
+            # These queries are defined in graphiti_core.models.*.node_db_queries etc.
+            # and should be available in the Neo4jProvider's scope (already imported).
+            if episodes_data:
+                await tx.run(EPISODIC_NODE_SAVE_BULK, episodes=episodes_data)
+            if entity_nodes_data:
+                await tx.run(ENTITY_NODE_SAVE_BULK, nodes=entity_nodes_data)
+            if episodic_edges_prepared_data:
+                await tx.run(EPISODIC_EDGE_SAVE_BULK, episodic_edges=episodic_edges_prepared_data)
+            if entity_edges_data:
+                await tx.run(ENTITY_EDGE_SAVE_BULK, entity_edges=entity_edges_data)
+            
+            logger.info(f"Neo4j bulk transaction processed: {len(ep_nodes)} ep_nodes, {len(en_nodes)} en_nodes, {len(ep_edges)} ep_edges, {len(en_edges)} en_edges.")
+
+        # Embedding generation should ideally happen *before* the transaction if it involves network I/O
+        # and the embedder client is not designed for use within a DB transaction context.
+        # The original `add_nodes_and_edges_bulk_tx` did it inside.
+        # For Kuzu, it was outside. Let's keep it consistent with Kuzu and do it outside the Neo4j transaction too.
+        
+        logger.info(f"Neo4jProvider: Starting bulk add. Generating embeddings first...")
+        # Entity Nodes Embeddings
+        for node in entity_nodes:
+            if node.name_embedding is None and hasattr(node, 'name') and node.name:
+                text_to_embed = node.name.replace('\n', ' ')
+                embedding_result = await embedder.create(input_data=[text_to_embed])
+                if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                    node.name_embedding = embedding_result[0]
+        
+        # Entity Edges Embeddings
+        for edge in entity_edges:
+            if edge.fact_embedding is None and hasattr(edge, 'fact') and edge.fact:
+                text_to_embed = edge.fact.replace('\n', ' ')
+                embedding_result = await embedder.create(input_data=[text_to_embed])
+                if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                    edge.fact_embedding = embedding_result[0]
+        logger.info("Embeddings generated. Proceeding with Neo4j transaction.")
+
+        async with self.get_session() as session:
+            await session.execute_write(
+                _add_nodes_and_edges_bulk_tx, # Pass the actual transaction function
+                episodic_nodes,
+                episodic_edges,
+                entity_nodes,
+                entity_edges,
+                embedder, # Embedder is passed but embeddings are now pre-generated
+            )
+        logger.info("Neo4j bulk add_nodes_and_edges operation completed.")

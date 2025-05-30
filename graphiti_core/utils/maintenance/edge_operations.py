@@ -35,7 +35,12 @@ from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_edges import EdgeDuplicate, UniqueFacts
 from graphiti_core.prompts.extract_edges import ExtractedEdges, MissingFacts
 from graphiti_core.search.search_filters import SearchFilters
-from graphiti_core.search.search_utils import get_edge_invalidation_candidates, get_relevant_edges
+# Calls to get_relevant_edges and get_edge_invalidation_candidates will be changed
+# to use provider methods directly, so these specific imports might become unused if these
+# functions in search_utils are mere wrappers or Neo4j specific.
+# For now, assume they might be used if they contain provider-agnostic logic on top of provider calls.
+# However, the prompt implies these methods are now part of the provider.
+# from graphiti_core.search.search_utils import get_edge_invalidation_candidates, get_relevant_edges
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -89,7 +94,7 @@ async def extract_edges(
 ) -> list[EntityEdge]:
     start = time()
 
-    extract_edges_max_tokens = 16384
+    # extract_edges_max_tokens = 16384 # This seems to be unused.
     llm_client = clients.llm_client
 
     edge_types_context = (
@@ -257,15 +262,16 @@ async def resolve_extracted_edges(
     edge_types: dict[str, BaseModel],
     edge_type_map: dict[tuple[str, str], list[str]],
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
-    driver = clients.driver
+    provider = clients.provider # Changed from clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder
 
     await create_entity_edge_embeddings(embedder, extracted_edges)
 
+    # Calls now use provider methods directly
     search_results: tuple[list[list[EntityEdge]], list[list[EntityEdge]]] = await semaphore_gather(
-        get_relevant_edges(driver, extracted_edges, SearchFilters()),
-        get_edge_invalidation_candidates(driver, extracted_edges, SearchFilters(), 0.2),
+        provider.get_relevant_edges(extracted_edges, SearchFilters()),
+        provider.get_edge_invalidation_candidates(extracted_edges, SearchFilters(), min_score=0.2), # Added min_score named param
     )
 
     related_edges_lists, edge_invalidation_candidates = search_results

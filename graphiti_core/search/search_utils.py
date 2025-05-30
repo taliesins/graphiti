@@ -70,15 +70,26 @@ DEFAULT_MMR_LAMBDA = 0.5  # General constant
 
 async def get_episodes_by_mentions( # This function seems to be unused by search.py, consider removal or refactor
     provider: GraphDatabaseProvider, # Changed driver to provider
-    nodes: list[EntityNode],
+    nodes: list[EntityNode], # Unused parameter
     edges: list[EntityEdge],
     limit: int = RELEVANT_SCHEMA_LIMIT,
 ) -> list[EpisodicNode]:
     episode_uuids: list[str] = []
     for edge in edges:
-        episode_uuids.extend(edge.episodes)
-    # EpisodicNode.get_by_uuids now takes provider
-    episodes = await EpisodicNode.get_by_uuids(provider, episode_uuids[:limit])
+        if edge.episodes: # Ensure episodes list is not None
+            episode_uuids.extend(edge.episodes)
+    
+    if not episode_uuids:
+        return []
+        
+    # Use provider.get_episodic_nodes_by_uuids
+    # Take unique UUIDs before querying, and then apply limit if necessary (though limit on UUIDs list is fine)
+    unique_episode_uuids = list(dict.fromkeys(episode_uuids)) # Preserve order while making unique
+    
+    # The limit here applies to how many UUIDs to fetch, not a DB limit.
+    # If the number of UUIDs is very large, it might be better to let the DB handle the limit.
+    # For now, respecting the original logic of limiting the list of UUIDs passed.
+    episodes = await provider.get_episodic_nodes_by_uuids(uuids=unique_episode_uuids[:limit])
     return episodes
 
 

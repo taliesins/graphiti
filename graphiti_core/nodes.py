@@ -301,10 +301,23 @@ class CommunityNode(Node):
 # These helpers are primarily used by Neo4jProvider now.
 # They might be moved to the provider module or a shared parsing utility later.
 def get_episodic_node_from_record(record: Any) -> EpisodicNode:
+    # Corrected created_at parsing
+    created_at_val = record['created_at']
+    if hasattr(created_at_val, 'to_native'):
+        created_at_dt = created_at_val.to_native()
+    else:
+        created_at_dt = created_at_val # Assume it's already a datetime object
+
+    valid_at_val = record['valid_at']
+    if hasattr(valid_at_val, 'to_native'):
+        valid_at_dt = valid_at_val.to_native()
+    else:
+        valid_at_dt = valid_at_val # Assume it's already a datetime object
+
     return EpisodicNode(
         content=record['content'],
-        created_at=record['created_at'].to_native().timestamp(), # This might need adjustment based on provider
-        valid_at=(record['valid_at'].to_native()),
+        created_at=created_at_dt, 
+        valid_at=valid_at_dt,
         uuid=record['uuid'],
         group_id=record['group_id'],
         source=EpisodeType.from_str(record['source']),

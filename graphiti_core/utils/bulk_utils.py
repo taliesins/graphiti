@@ -20,27 +20,31 @@ from collections import defaultdict
 from datetime import datetime
 from math import ceil
 
-from neo4j import AsyncDriver, AsyncManagedTransaction
+# Remove direct Neo4j imports if they are no longer needed after refactoring
+# from neo4j import AsyncDriver, AsyncManagedTransaction 
 from numpy import dot, sqrt
 from pydantic import BaseModel
 from typing_extensions import Any
 
+from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.graphiti_types import GraphitiClients
-from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
+from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather # DEFAULT_DATABASE might be Neo4j specific
 from graphiti_core.llm_client import LLMClient
-from graphiti_core.models.edges.edge_db_queries import (
-    ENTITY_EDGE_SAVE_BULK,
-    EPISODIC_EDGE_SAVE_BULK,
-)
-from graphiti_core.models.nodes.node_db_queries import (
-    ENTITY_NODE_SAVE_BULK,
-    EPISODIC_NODE_SAVE_BULK,
-)
+# These DB queries are Neo4j specific and should be part of Neo4jProvider
+# from graphiti_core.models.edges.edge_db_queries import (
+#     ENTITY_EDGE_SAVE_BULK,
+#     EPISODIC_EDGE_SAVE_BULK,
+# )
+# from graphiti_core.models.nodes.node_db_queries import (
+#     ENTITY_NODE_SAVE_BULK,
+#     EPISODIC_NODE_SAVE_BULK,
+# )
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
-from graphiti_core.search.search_utils import get_relevant_edges, get_relevant_nodes
+# get_relevant_edges and get_relevant_nodes will also need to be refactored to use Provider
+from graphiti_core.search.search_utils import get_relevant_edges, get_relevant_nodes 
 from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.edge_operations import (
     build_episodic_edges,
@@ -48,10 +52,8 @@ from graphiti_core.utils.maintenance.edge_operations import (
     dedupe_extracted_edges,
     extract_edges,
 )
-from graphiti_core.utils.maintenance.graph_data_operations import (
-    EPISODE_WINDOW_LEN,
-    retrieve_episodes,
-)
+# retrieve_episodes is now part of the provider interface
+from graphiti_core.utils.maintenance.graph_data_operations import EPISODE_WINDOW_LEN 
 from graphiti_core.utils.maintenance.node_operations import (
     dedupe_extracted_nodes,
     dedupe_node_list,
@@ -73,12 +75,15 @@ class RawEpisode(BaseModel):
 
 
 async def retrieve_previous_episodes_bulk(
-    driver: AsyncDriver, episodes: list[EpisodicNode]
+    provider: GraphDatabaseProvider, episodes: list[EpisodicNode]
 ) -> list[tuple[EpisodicNode, list[EpisodicNode]]]:
     previous_episodes_list = await semaphore_gather(
         *[
-            retrieve_episodes(
-                driver, episode.valid_at, last_n=EPISODE_WINDOW_LEN, group_ids=[episode.group_id]
+            provider.retrieve_episodes(
+                reference_time=episode.valid_at, 
+                last_n=EPISODE_WINDOW_LEN, 
+                group_ids=[episode.group_id] if episode.group_id else None,
+                # source=episode.source # Optional: if retrieve_episodes supports filtering by source EpisodeType
             )
             for episode in episodes
         ]
@@ -91,81 +96,25 @@ async def retrieve_previous_episodes_bulk(
 
 
 async def add_nodes_and_edges_bulk(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider,
     episodic_nodes: list[EpisodicNode],
     episodic_edges: list[EpisodicEdge],
     entity_nodes: list[EntityNode],
     entity_edges: list[EntityEdge],
     embedder: EmbedderClient,
 ):
-    async with driver.session(database=DEFAULT_DATABASE) as session:
-        await session.execute_write(
-            add_nodes_and_edges_bulk_tx,
-            episodic_nodes,
-            episodic_edges,
-            entity_nodes,
-            entity_edges,
-            embedder,
-        )
-
-
-async def add_nodes_and_edges_bulk_tx(
-    tx: AsyncManagedTransaction,
-    episodic_nodes: list[EpisodicNode],
-    episodic_edges: list[EpisodicEdge],
-    entity_nodes: list[EntityNode],
-    entity_edges: list[EntityEdge],
-    embedder: EmbedderClient,
-):
-    episodes = [dict(episode) for episode in episodic_nodes]
-    for episode in episodes:
-        episode['source'] = str(episode['source'].value)
-    nodes: list[dict[str, Any]] = []
-    for node in entity_nodes:
-        if node.name_embedding is None:
-            await node.generate_name_embedding(embedder)
-        entity_data: dict[str, Any] = {
-            'uuid': node.uuid,
-            'name': node.name,
-            'name_embedding': node.name_embedding,
-            'group_id': node.group_id,
-            'summary': node.summary,
-            'created_at': node.created_at,
-        }
-
-        entity_data.update(node.attributes or {})
-        entity_data['labels'] = list(set(node.labels + ['Entity']))
-        nodes.append(entity_data)
-
-    edges: list[dict[str, Any]] = []
-    for edge in entity_edges:
-        if edge.fact_embedding is None:
-            await edge.generate_embedding(embedder)
-        edge_data: dict[str, Any] = {
-            'uuid': edge.uuid,
-            'source_node_uuid': edge.source_node_uuid,
-            'target_node_uuid': edge.target_node_uuid,
-            'name': edge.name,
-            'fact': edge.fact,
-            'fact_embedding': edge.fact_embedding,
-            'group_id': edge.group_id,
-            'episodes': edge.episodes,
-            'created_at': edge.created_at,
-            'expired_at': edge.expired_at,
-            'valid_at': edge.valid_at,
-            'invalid_at': edge.invalid_at,
-        }
-
-        edge_data.update(edge.attributes or {})
-        edges.append(edge_data)
-
-    await tx.run(EPISODIC_NODE_SAVE_BULK, episodes=episodes)
-    await tx.run(ENTITY_NODE_SAVE_BULK, nodes=nodes)
-    await tx.run(
-        EPISODIC_EDGE_SAVE_BULK, episodic_edges=[edge.model_dump() for edge in episodic_edges]
+    # The provider itself will handle how to execute this bulk operation,
+    # including session/transaction management if applicable.
+    await provider.add_nodes_and_edges_bulk(
+        episodic_nodes=episodic_nodes,
+        episodic_edges=episodic_edges,
+        entity_nodes=entity_nodes,
+        entity_edges=entity_edges,
+        embedder=embedder,
     )
-    await tx.run(ENTITY_EDGE_SAVE_BULK, entity_edges=edges)
 
+# The add_nodes_and_edges_bulk_tx function is removed from here.
+# Its logic will be moved to the Neo4jProvider's implementation of add_nodes_and_edges_bulk.
 
 async def extract_nodes_and_edges_bulk(
     clients: GraphitiClients, episode_tuples: list[tuple[EpisodicNode, list[EpisodicNode]]]
@@ -211,7 +160,7 @@ async def extract_nodes_and_edges_bulk(
 
 
 async def dedupe_nodes_bulk(
-    driver: AsyncDriver,
+    provider: GraphDatabaseProvider, # Changed from driver
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
 ) -> tuple[list[EntityNode], dict[str, str]]:
@@ -222,9 +171,11 @@ async def dedupe_nodes_bulk(
 
     node_chunks = [nodes[i : i + CHUNK_SIZE] for i in range(0, len(nodes), CHUNK_SIZE)]
 
+    # get_relevant_nodes needs to be refactored to accept a provider.
+    # Assuming get_relevant_nodes is updated elsewhere.
     existing_nodes_chunks: list[list[EntityNode]] = list(
         await semaphore_gather(
-            *[get_relevant_nodes(driver, node_chunk, SearchFilters()) for node_chunk in node_chunks]
+            *[get_relevant_nodes(provider, node_chunk, SearchFilters()) for node_chunk in node_chunks] # Pass provider
         )
     )
 
@@ -247,7 +198,9 @@ async def dedupe_nodes_bulk(
 
 
 async def dedupe_edges_bulk(
-    driver: AsyncDriver, llm_client: LLMClient, extracted_edges: list[EntityEdge]
+    provider: GraphDatabaseProvider, # Changed from driver
+    llm_client: LLMClient, 
+    extracted_edges: list[EntityEdge]
 ) -> list[EntityEdge]:
     # First compress edges
     compressed_edges = await compress_edges(llm_client, extracted_edges)
@@ -256,9 +209,11 @@ async def dedupe_edges_bulk(
         compressed_edges[i : i + CHUNK_SIZE] for i in range(0, len(compressed_edges), CHUNK_SIZE)
     ]
 
+    # get_relevant_edges needs to be refactored to accept a provider.
+    # Assuming get_relevant_edges is updated elsewhere.
     relevant_edges_chunks: list[list[EntityEdge]] = list(
         await semaphore_gather(
-            *[get_relevant_edges(driver, edge_chunk, SearchFilters()) for edge_chunk in edge_chunks]
+            *[get_relevant_edges(provider, edge_chunk, SearchFilters()) for edge_chunk in edge_chunks] # Pass provider
         )
     )
 

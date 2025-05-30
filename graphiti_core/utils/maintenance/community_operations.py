@@ -2,14 +2,17 @@ import asyncio
 import logging
 from collections import defaultdict
 
-from neo4j import AsyncDriver
+# Remove neo4j import, use provider
+# from neo4j import AsyncDriver 
 from pydantic import BaseModel
 
+from graphiti_core.providers.base import GraphDatabaseProvider # Import Provider
 from graphiti_core.edges import CommunityEdge
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
+# DEFAULT_DATABASE might be Neo4j specific, consider if it's needed or part of provider config
+from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather 
 from graphiti_core.llm_client import LLMClient
-from graphiti_core.nodes import CommunityNode, EntityNode, get_community_node_from_record
+from graphiti_core.nodes import CommunityNode, EntityNode, get_community_node_from_record # get_community_node_from_record might be provider specific parsing logic
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.summarize_nodes import Summary, SummaryDescription
 from graphiti_core.utils.datetime_utils import utc_now
@@ -26,27 +29,32 @@ class Neighbor(BaseModel):
 
 
 async def get_community_clusters(
-    driver: AsyncDriver, group_ids: list[str] | None
+    provider: GraphDatabaseProvider, group_ids: list[str] | None
 ) -> list[list[EntityNode]]:
     community_clusters: list[list[EntityNode]] = []
 
     if group_ids is None:
-        group_id_values, _, _ = await driver.execute_query(
+        # This query is generic enough to be run via provider.execute_query
+        # However, ideally, there'd be a provider method if this is a common pattern.
+        group_id_records, _, _ = await provider.execute_query(
             """
         MATCH (n:Entity WHERE n.group_id IS NOT NULL)
         RETURN 
             collect(DISTINCT n.group_id) AS group_ids
-        """,
-            database_=DEFAULT_DATABASE,
+        """
+            # database_=DEFAULT_DATABASE, # Database selection is part of provider's configuration or execute_query kwargs
         )
+        # Ensure group_id_records is not empty and has the expected structure
+        group_ids = group_id_records[0]['group_ids'] if group_id_records and group_id_records[0].get('group_ids') else []
 
-        group_ids = group_id_values[0]['group_ids']
 
     for group_id in group_ids:
         projection: dict[str, list[Neighbor]] = {}
-        nodes = await EntityNode.get_by_group_ids(driver, [group_id])
+        # Replace EntityNode.get_by_group_ids with provider call
+        nodes = await provider.get_entity_nodes_by_group_ids(group_ids=[group_id])
         for node in nodes:
-            records, _, _ = await driver.execute_query(
+            # This query is specific and can be run via provider.execute_query
+            records, _, _ = await provider.execute_query(
                 """
             MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[r:RELATES_TO]-(m: Entity {group_id: $group_id})
             WITH count(r) AS count, m.uuid AS uuid
@@ -54,9 +62,8 @@ async def get_community_clusters(
                 uuid,
                 count
             """,
-                uuid=node.uuid,
-                group_id=group_id,
-                database_=DEFAULT_DATABASE,
+                params={"uuid": node.uuid, "group_id": group_id}
+                # database_=DEFAULT_DATABASE,
             )
 
             projection[node.uuid] = [
@@ -64,14 +71,19 @@ async def get_community_clusters(
             ]
 
         cluster_uuids = label_propagation(projection)
+        
+        # Replace EntityNode.get_by_uuids with provider call
+        # semaphore_gather might still be useful if provider.get_entity_nodes_by_uuids for many individual clusters is slow
+        # But get_entity_nodes_by_uuids takes a list, so we can batch it if needed.
+        # For now, let's assume one call per cluster or batching them if the provider method supports it well.
+        # The original code did N calls for N clusters.
+        
+        for cluster_uuid_list in cluster_uuids:
+            if cluster_uuid_list: # Ensure list is not empty
+                 # get_entity_nodes_by_uuids expects List[str]
+                cluster_nodes = await provider.get_entity_nodes_by_uuids(uuids=cluster_uuid_list)
+                community_clusters.append(cluster_nodes)
 
-        community_clusters.extend(
-            list(
-                await semaphore_gather(
-                    *[EntityNode.get_by_uuids(driver, cluster) for cluster in cluster_uuids]
-                )
-            )
-        )
 
     return community_clusters
 
@@ -194,15 +206,16 @@ async def build_community(
 
 
 async def build_communities(
-    driver: AsyncDriver, llm_client: LLMClient, group_ids: list[str] | None
+    provider: GraphDatabaseProvider, llm_client: LLMClient, group_ids: list[str] | None
 ) -> tuple[list[CommunityNode], list[CommunityEdge]]:
-    community_clusters = await get_community_clusters(driver, group_ids)
+    # get_community_clusters now takes a provider
+    community_clusters = await get_community_clusters(provider, group_ids)
 
     semaphore = asyncio.Semaphore(MAX_COMMUNITY_BUILD_CONCURRENCY)
 
     async def limited_build_community(cluster):
         async with semaphore:
-            return await build_community(llm_client, cluster)
+            return await build_community(llm_client, cluster) # build_community is algorithmic
 
     communities: list[tuple[CommunityNode, list[CommunityEdge]]] = list(
         await semaphore_gather(
@@ -215,25 +228,37 @@ async def build_communities(
     for community in communities:
         community_nodes.append(community[0])
         community_edges.extend(community[1])
+    
+    # After building, these nodes and edges need to be saved using the provider.
+    # This function should ideally also take the provider and save them.
+    # For now, just returning them as per original structure.
+    # Caller (e.g. Graphiti class) would be responsible for saving.
+    # OR, this function could save them:
+    # for node in community_nodes: await provider.save_community_node(node)
+    # for edge in community_edges: await provider.save_community_edge(edge)
+    # Let's assume for now the caller saves them.
 
     return community_nodes, community_edges
 
 
-async def remove_communities(driver: AsyncDriver):
-    await driver.execute_query(
+async def remove_communities(provider: GraphDatabaseProvider):
+    # This query is generic enough for provider.execute_query
+    await provider.execute_query(
         """
     MATCH (c:Community)
     DETACH DELETE c
-    """,
-        database_=DEFAULT_DATABASE,
+    """
+        # database_=DEFAULT_DATABASE, # Provider configured for db
     )
 
 
 async def determine_entity_community(
-    driver: AsyncDriver, entity: EntityNode
+    provider: GraphDatabaseProvider, entity: EntityNode
 ) -> tuple[CommunityNode | None, bool]:
     # Check if the node is already part of a community
-    records, _, _ = await driver.execute_query(
+    # Query is generic for provider.execute_query
+    # get_community_node_from_record might need to be provider-agnostic or handled by provider methods
+    records, _, _ = await provider.execute_query(
         """
     MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid: $entity_uuid})
     RETURN
@@ -241,17 +266,19 @@ async def determine_entity_community(
         c.name AS name,
         c.group_id AS group_id,
         c.created_at AS created_at, 
-        c.summary AS summary
-    """,
-        entity_uuid=entity.uuid,
-        database_=DEFAULT_DATABASE,
+        c.summary AS summary,
+        c.name_embedding AS name_embedding 
+    """, # Added name_embedding
+        params={"entity_uuid": entity.uuid}
+        # database_=DEFAULT_DATABASE,
     )
 
     if len(records) > 0:
+        # Assuming get_community_node_from_record can handle the raw dict from provider.execute_query
         return get_community_node_from_record(records[0]), False
 
     # If the node has no community, add it to the mode community of surrounding entities
-    records, _, _ = await driver.execute_query(
+    records, _, _ = await provider.execute_query(
         """
     MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
     RETURN
@@ -259,10 +286,11 @@ async def determine_entity_community(
         c.name AS name,
         c.group_id AS group_id,
         c.created_at AS created_at, 
-        c.summary AS summary
-    """,
-        entity_uuid=entity.uuid,
-        database_=DEFAULT_DATABASE,
+        c.summary AS summary,
+        c.name_embedding AS name_embedding
+    """, # Added name_embedding
+        params={"entity_uuid": entity.uuid}
+        # database_=DEFAULT_DATABASE,
     )
 
     communities: list[CommunityNode] = [
@@ -275,9 +303,9 @@ async def determine_entity_community(
 
     community_uuid = None
     max_count = 0
-    for uuid, count in community_map.items():
+    for uuid_key, count in community_map.items(): # Changed uuid to uuid_key to avoid conflict
         if count > max_count:
-            community_uuid = uuid
+            community_uuid = uuid_key
             max_count = count
 
     if max_count == 0:
@@ -291,23 +319,25 @@ async def determine_entity_community(
 
 
 async def update_community(
-    driver: AsyncDriver, llm_client: LLMClient, embedder: EmbedderClient, entity: EntityNode
+    provider: GraphDatabaseProvider, llm_client: LLMClient, embedder: EmbedderClient, entity: EntityNode
 ):
-    community, is_new = await determine_entity_community(driver, entity)
+    community, is_new = await determine_entity_community(provider, entity)
 
     if community is None:
         return
 
-    new_summary = await summarize_pair(llm_client, (entity.summary, community.summary))
+    new_summary = await summarize_pair(llm_client, (str(entity.summary or ""), str(community.summary or ""))) # Ensure strings
     new_name = await generate_summary_description(llm_client, new_summary)
 
     community.summary = new_summary
     community.name = new_name
+    
+    # Embedding generation should be handled by provider or before calling save method
+    await community.generate_name_embedding(embedder) # This method is on the Pydantic model
+
+    # Replace direct save with provider methods
+    await provider.save_community_node(community)
 
     if is_new:
         community_edge = (build_community_edges([entity], community, utc_now()))[0]
-        await community_edge.save(driver)
-
-    await community.generate_name_embedding(embedder)
-
-    await community.save(driver)
+        await provider.save_community_edge(community_edge)
