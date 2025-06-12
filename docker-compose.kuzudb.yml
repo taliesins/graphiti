@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  kuzudb:
+    image: ghcr.io/kuzudb/kuzudb:latest
+    ports:
+      - "8080:8080" # Default KùzuDB HTTP port, if ever needed. KùzuDB primarily uses direct library access.
+    volumes:
+      - ./kuzu_data:/kuzu_data # Mount a local directory for data persistence
+    environment:
+      # KùzuDB typically doesn't require extensive environment variables for basic setup
+      # It's configured via client connection parameters (database path)
+      # The volume mount above handles the database path persistence
+      KUZU_DATABASE_PATH: /kuzu_data/graphiti_kuzudb
+    # KùzuDB doesn't have a built-in healthcheck via HTTP in the same way some other DBs do.
+    # Client-side connection attempt is the typical healthcheck.
+    # For compose, we can rely on the container starting.
+    # command: # Optional: specify command if needed to change default behavior or db path

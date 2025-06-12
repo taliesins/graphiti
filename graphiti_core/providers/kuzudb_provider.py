@@ -1,7 +1,7 @@
 import logging
 import json # For serializing/deserializing MAP attributes
 from datetime import datetime
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple, Set
 
 import kuzu
 from graphiti_core.providers.base import GraphDatabaseProvider
@@ -17,17 +17,57 @@ from graphiti_core.edges import (
     CommunityEdge,
 )
 from graphiti_core.embedder import EmbedderClient
-# Assuming SearchFilters and EpisodeType are accessible, adjust imports if not.
-from pydantic import BaseModel # Needed for SearchFilters if defined inline, or imported
+from pydantic import BaseModel, Field # Needed for SearchFilters if defined inline, or imported
+from enum import Enum
+
 
 logger = logging.getLogger(__name__)
 
-# Placeholder for SearchFilters if not imported - for type hinting
+# Moved from neo4j_provider, consider a common types file later
+class ComparisonOperator(str, Enum):
+    EQUALS = "="
+    NOT_EQUALS = "<>"
+    GREATER_THAN = ">"
+    GREATER_THAN_OR_EQUALS = ">="
+    LESS_THAN = "<"
+    LESS_THAN_OR_EQUALS = "<="
+    CONTAINS = "CONTAINS" # For string or list properties
+    STARTS_WITH = "STARTS WITH"
+    ENDS_WITH = "ENDS WITH"
+    # Note: KuzuDB might not support all of these directly in Cypher or may have different syntax
+
+class DateFilter(BaseModel):
+    date: datetime
+    operator: ComparisonOperator = ComparisonOperator.EQUALS
+
+class AttributeFilter(BaseModel):
+    key: str
+    value: Any
+    operator: ComparisonOperator = ComparisonOperator.EQUALS
+    # For KuzuDB, 'attributes' is a JSON string. Direct complex queries on it are hard.
+    # This might be simplified to exact match on specific extracted top-level attributes if Kuzu allows.
+    # For now, this implies filtering after fetching or simplified string CONTAINS if feasible.
+
 class SearchFilters(BaseModel): # type: ignore
-    # Define fields if specific filter logic is implemented, otherwise pass is fine
-    node_labels: Optional[List[str]] = None
-    edge_types: Optional[List[str]] = None
-    # Add other filter fields like valid_at, created_at if they will be used by Kuzu specific filters
+    node_labels: Optional[List[str]] = None # e.g., ["Entity", "CustomLabel"] - Kuzu has fixed tables
+    edge_types: Optional[List[str]] = None   # e.g., ["RELATES_TO"] - Kuzu has fixed tables
+
+    # Date filters - applied to 'created_at' or 'valid_at' based on context
+    created_at_filter: Optional[DateFilter] = None
+    valid_at_filter: Optional[DateFilter] = None # Usually for EpisodicNode or time-bound edges
+
+    # Attribute filtering - more complex for Kuzu due to JSON string attributes
+    # This is a conceptual placeholder; actual implementation in _apply_search_filters_to_query_basic
+    # will need to be very careful about how Kuzu can filter JSON string attributes.
+    # It might be limited to simple string CONTAINS for the serialized JSON, or not directly supportable.
+    attribute_filters: Optional[List[AttributeFilter]] = None
+
+    # For KuzuDB, group_id is often a direct property, not in 'attributes'
+    group_id_filter: Optional[str] = None # If filtering by a single group_id not already in main method params
+
+    # Raw Cypher WHERE clause to append (use with extreme caution)
+    # This is generally not recommended for safety and portability but can be a backdoor.
+    raw_where_clause: Optional[str] = Field(None, exclude=True) # Exclude from model_dump by default
 
 
 class KuzuDBProvider(GraphDatabaseProvider):
@@ -550,46 +590,115 @@ class KuzuDBProvider(GraphDatabaseProvider):
         search_filter: SearchFilters,
         alias: str, # e.g., "n" for node, "r" for relationship
         params: Dict[str, Any] # to add new parameter names and values
-    ) -> str: # Returns a string of Cypher WHERE clauses
-        """
-        Applies basic property filters from SearchFilters.
-        Note: This is a simplified filter application. KuzuDB might require
-        specific functions for date, list operations, or complex types.
-        This current version primarily demonstrates adding exact match filters.
-        SearchFilters model would need to be extended to carry these specific filter fields.
-        """
+    ) -> str:
         filter_clauses: List[str] = []
 
-        # Hypothetical example: if SearchFilters had a 'name_must_equal' field
-        if hasattr(search_filter, 'name_must_equal') and search_filter.name_must_equal is not None:
-            param_name = f"{alias}_name_filter"
-            filter_clauses.append(f"{alias}.name = ${param_name}")
-            params[param_name] = search_filter.name_must_equal
+        # group_id_filter (if SearchFilters has it and it's not a primary method param)
+        if search_filter.group_id_filter:
+            param_name = f"{alias}_group_id_filter"
+            filter_clauses.append(f"{alias}.group_id = ${param_name}")
+            params[param_name] = search_filter.group_id_filter
 
-        # Hypothetical example: if SearchFilters had 'custom_properties_equal' as Dict[str, Any]
-        if hasattr(search_filter, 'custom_properties_equal') and search_filter.custom_properties_equal:
-            for prop_name, prop_value in search_filter.custom_properties_equal.items():
-                # Sanitize prop_name if it can come from user input (not an issue here)
-                param_name = f"{alias}_custom_{prop_name}"
-                filter_clauses.append(f"{alias}.`{prop_name}` = ${param_name}") # Use backticks for safety
-                params[param_name] = prop_value
+        # Date filters
+        # Note: KuzuDB expects TIMESTAMP type for date comparisons.
+        # Ensure datetime objects are passed correctly.
+        if search_filter.created_at_filter:
+            op = search_filter.created_at_filter.operator
+            # Kuzu Cypher might not support all comparison ops directly like this or need casting.
+            # This is a direct translation; testing will verify Kuzu's capabilities.
+            if op not in [ComparisonOperator.CONTAINS, ComparisonOperator.STARTS_WITH, ComparisonOperator.ENDS_WITH]:
+                param_name = f"{alias}_created_at_date"
+                filter_clauses.append(f"{alias}.created_at {op.value} ${param_name}")
+                params[param_name] = search_filter.created_at_filter.date
+
+        if search_filter.valid_at_filter: # Typically for EpisodicNode or specific edges
+            op = search_filter.valid_at_filter.operator
+            if op not in [ComparisonOperator.CONTAINS, ComparisonOperator.STARTS_WITH, ComparisonOperator.ENDS_WITH]:
+                param_name = f"{alias}_valid_at_date"
+                # Ensure the property exists on the aliased item (e.g., e.valid_at for Episodic)
+                filter_clauses.append(f"{alias}.valid_at {op.value} ${param_name}")
+                params[param_name] = search_filter.valid_at_filter.date
+
+        # Attribute filters: This is the most complex part for KuzuDB
+        # KuzuDB stores 'attributes' as a STRING (JSON). Direct querying of JSON content is limited.
+        # A common workaround is to use string CONTAINS for simple key-value checks if the JSON structure is predictable.
+        # e.g., attributes CONTAINS '"key":"value"'
+        # This is brittle. For more robust attribute filtering, consider:
+        # 1. Promoting frequently filtered attributes to top-level schema properties.
+        # 2. Fetching and filtering in the application layer (less efficient).
+        # 3. Using Kuzu's future potential JSON/struct processing functions if they become available.
+        if search_filter.attribute_filters:
+            for i, attr_filter in enumerate(search_filter.attribute_filters):
+                # Simplified: only support EQUALS and CONTAINS on the stringified attributes
+                # This is a very basic and potentially slow way to filter JSON strings.
+                # For EQUALS on a specific key:
+                if attr_filter.operator == ComparisonOperator.EQUALS:
+                    # Example: attributes CONTAINS '"key":"value"' (stringified value)
+                    # This is highly dependent on JSON serialization format (spaces, quotes, etc.)
+                    # A safer bet is to filter for the key existing, then value separately if possible.
+                    # For now, a very naive CONTAINS:
+                    attr_param_name = f"{alias}_attr_val_{i}"
+                    # This filter is very basic and might not be robust enough.
+                    # It assumes 'attributes' is the column name.
+                    # We are checking if the stringified key-value pair is present.
+                    # json.dumps is used to get a consistent string representation.
+                    # Ensure simple types for attr_filter.value (str, int, bool)
+                    try:
+                        # Create a mini-dict for the specific key-value to search for its string form
+                        # This is still very fragile. E.g. {"key": "value"} vs {"key": "value", "other": "data"}
+                        # A better CONTAINS might be just for the value if key is known:
+                        # WHERE attributes CONTAINS '"key":"' AND attributes CONTAINS ':"value"' (problematic with nested/complex values)
+
+                        # Let's attempt a CONTAINS for the value part of a key-value pair.
+                        # This assumes the key is known and you're checking its value.
+                        # This is still not ideal.
+                        # Example: WHERE {alias}.attributes CONTAINS '"key_name":"value_as_string"'
+                        # This requires knowing the exact string representation in the JSON.
+
+                        # Given Kuzu's current limitations on JSON querying, we might have to state that
+                        # attribute_filters are not fully supported or only in a very limited way.
+                        # The most reliable way is to fetch and filter client-side for complex attribute queries.
+
+                        # For this iteration, let's only implement CONTAINS on the raw attributes string
+                        # for the filter's value, assuming the user knows what they are searching for
+                        # within the JSON string. This is not specific to a key.
+                        if attr_filter.operator == ComparisonOperator.CONTAINS and isinstance(attr_filter.value, str):
+                            filter_clauses.append(f"CONTAINS(lower({alias}.attributes), lower(${attr_param_name}))")
+                            params[attr_param_name] = attr_filter.value
+                            logger.debug(f"KuzuDB applying basic CONTAINS filter on attributes string for alias {alias} with value {attr_filter.value}")
+                        else:
+                            logger.warning(f"KuzuDB: Attribute filter operator '{attr_filter.operator}' for key '{attr_filter.key}' may not be fully supported or optimized. Only basic CONTAINS on stringified attributes is attempted.")
+                    except Exception as e:
+                        logger.error(f"KuzuDB: Error processing attribute filter for key '{attr_filter.key}': {e}")
+
+
+        # Raw Cypher WHERE clause (use with caution)
+        if search_filter.raw_where_clause:
+            # IMPORTANT: This is a potential security risk if raw_where_clause comes from untrusted input.
+            # It also makes the query less portable and harder to maintain.
+            # Parameter binding is NOT done for raw_where_clause here.
+            filter_clauses.append(f"({search_filter.raw_where_clause})")
+            logger.warning("KuzuDB: Applied a raw_where_clause. Ensure it's sanitized and correct.")
 
         return " AND ".join(filter_clauses) if filter_clauses else ""
 
 
     async def node_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EntityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Current FTS uses case-insensitive CONTAINS, offering basic substring matching.
-        # For advanced FTS (e.g., stemming, ranking, specific operators), KuzuDB might offer
-        # dedicated FTS indexing (e.g., via extensions) and query functions, which should be preferred if available.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
         
+        # Base FTS condition
         where_clauses = ["(CONTAINS(lower(n.name), $query_str_lower) OR CONTAINS(lower(n.summary), $query_str_lower))"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("n.group_id IN $gids")
             params["gids"] = group_ids
         
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="n") # Assuming this might add more clauses
+        # Apply additional filters from SearchFilters object
+        # The params dict will be updated by _apply_search_filters_to_query_basic
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "n", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
         
         final_query = f"MATCH (n:Entity) WHERE {' AND '.join(where_clauses)} RETURN n.uuid, n.name, n.group_id, n.created_at, n.summary, n.name_embedding, n.attributes LIMIT $limit_val"
         results, _, _ = await self.execute_query(final_query, params)
@@ -604,11 +713,15 @@ class KuzuDBProvider(GraphDatabaseProvider):
         
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         where_clauses = [f"{KUZU_SIMILARITY_FUNCTION}(n.name_embedding, $s_vec) >= $min_s"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("n.group_id IN $gids")
             params["gids"] = group_ids
         
-        self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="n")
+        # Apply additional filters from SearchFilters object
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "n", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         final_query = f"MATCH (n:Entity) WHERE {' AND '.join(where_clauses)} RETURN n.uuid, n.name, n.group_id, n.created_at, n.summary, n.name_embedding, n.attributes, {KUZU_SIMILARITY_FUNCTION}(n.name_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
         try:
@@ -623,17 +736,19 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def edge_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EntityEdge]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Current FTS uses case-insensitive CONTAINS. See node_fulltext_search for notes on advanced FTS.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
 
-        # Assuming EntityEdges are of type RELATES_TO and connect Entity nodes
-        # Searching on 'name' and 'fact' properties of the edge
+        # Base FTS condition
         where_clauses = ["(CONTAINS(lower(r.name), $query_str_lower) OR CONTAINS(lower(r.fact), $query_str_lower))"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("r.group_id IN $gids") # Assuming edges can have group_ids
             params["gids"] = group_ids
         
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, edge_alias="r")
+        # Apply additional filters from SearchFilters object
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         final_query = f"MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) WHERE {' AND '.join(where_clauses)} RETURN r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, s.uuid as source_node_uuid, t.uuid as target_node_uuid LIMIT $limit_val"
         results, _, _ = await self.execute_query(final_query, params)
@@ -777,7 +892,8 @@ class KuzuDBProvider(GraphDatabaseProvider):
                  # Ensure all fields defined in schema are present, even if None
                 for key in ['uuid', 'name', 'group_id', 'source', 'source_description', 'content', 'valid_at', 'created_at', 'entity_edges']:
                     d.setdefault(key, None)
-                if d['entity_edges'] is None: d['entity_edges'] = [] # Kuzu expects list, not null for list type
+                if d.get('entity_edges') is None: # Ensure 'entity_edges' is an empty list if None
+                    d['entity_edges'] = []
                 episodic_data.append(d)
             episodic_df = pd.DataFrame(episodic_data)
             await _copy_from_df_to_kuzu("Episodic", episodic_df, node_table=True)
@@ -834,7 +950,8 @@ class KuzuDBProvider(GraphDatabaseProvider):
                 # Schema: uuid, name, group_id, fact, fact_embedding, episodes, created_at, expired_at, valid_at, invalid_at, attributes
                 for key in ['uuid', 'name', 'group_id', 'fact', 'fact_embedding', 'episodes', 'created_at', 'expired_at', 'valid_at', 'invalid_at', 'attributes', '_from', '_to']:
                      d.setdefault(key, None)
-                if d['episodes'] is None: d['episodes'] = []
+                if d.get('episodes') is None: # Ensure 'episodes' is an empty list if None
+                    d['episodes'] = []
                 entity_edge_data.append(d)
             entity_edge_df = pd.DataFrame(entity_edge_data)
             cols_for_relates_to = ['_from', '_to', 'uuid', 'name', 'group_id', 'fact', 'fact_embedding', 'episodes', 'created_at', 'expired_at', 'valid_at', 'invalid_at', 'attributes']
@@ -890,11 +1007,15 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if target_node_uuid:
             where_clauses.append("t.uuid = $target_uuid")
             params["target_uuid"] = target_node_uuid
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("r.group_id IN $gids") # Assuming edges can have group_ids
             params["gids"] = group_ids
 
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, edge_alias="r")
+        # Apply additional filters from SearchFilters object
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         return_cols = "r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, s.uuid as source_node_uuid, t.uuid as target_node_uuid"
         final_query = f"{' '.join(match_clauses)} WHERE {' AND '.join(where_clauses)} RETURN {return_cols}, {KUZU_SIMILARITY_FUNCTION}(r.fact_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
@@ -924,43 +1045,81 @@ class KuzuDBProvider(GraphDatabaseProvider):
             # Example: search_filter.edge_types = ["RELATES_TO", "MENTIONS"] -> ":RELATES_TO|MENTIONS"
             edge_type_str = ":" + "|".join(search_filter.edge_types)
 
-        # This query returns a list of relationships for each path. We need to flatten and unique them.
-        # Simpler: Collect distinct edges found in paths up to max_depth.
-        query = f"""
-        MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
-        WHERE origin.uuid IN $origin_uuids
-        UNWIND rels AS r // Unwind the list of relationships in each path
-        WITH origin, peer, r // Make r, peer, origin available for filtering
-        // Apply search_filter to properties of 'r' (edge)
-        // And potentially to 'peer' (target node of the edge in path) or 'origin'
-        // This example applies filters to 'r'.
-        // The _apply_search_filters_to_query_basic needs params dict to add its parameters
-        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
-        additional_where_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+        # The _apply_search_filters_to_query_basic needs params dict to add its parameters
+        params: Dict[str, Any] = {"origin_uuids": bfs_origin_node_uuids, "lim": limit} # Moved params initialization up
 
-        final_where_clause = "WHERE " + additional_where_clauses_str if additional_where_clauses_str else ""
+        # Base WHERE for origin UUIDs
+        path_match_where_clauses = ["origin.uuid IN $origin_uuids"]
+        # Additional filters on the relationship 'r' itself
+        # Note: Kuzu's BFS MATCH...WHERE applies to the path pattern, not UNWINDed elements easily.
+        # So, filtering on 'r' properties might be less direct or require subqueries if complex.
+        # The current _apply_search_filters_to_query_basic is designed for simple property checks.
+        # If search_filter.edge_types is used, it should be part of the MATCH pattern: (o)-[r:{edge_type_str}*1..{max_depth}]->(p)
+        # For now, applying filters on 'r' post-UNWIND.
 
-        query = f"""
-        MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
-        WHERE origin.uuid IN $origin_uuids
-        UNWIND rels AS r
-        WITH origin, peer, r // Expose r for filtering
-        {final_where_clause} // Apply filters on r
-        RETURN DISTINCT r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes,
-                       r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes,
-                       startNode(r).uuid AS source_node_uuid, endNode(r).uuid AS target_node_uuid
-        LIMIT $lim
-        """
-        # Note: The relationship type for 'r' is implicitly EntityEdge (RELATES_TO) due to (Entity)-[]->(Entity) pattern.
-        # If search_filter.edge_types was used in path pattern, this filtering on 'r' assumes properties common to those types.
-        # The current RETURN statement assumes 'r' has EntityEdge properties.
+        # Construct the core MATCH part
+        # If search_filter.edge_types has values, use them in the path pattern for efficiency
+        # Example: edge_type_str = search_filter.edge_types.join("|") -> MATCH (o)-[r:${edge_type_str}*1..${max_depth}]->(p)
+        # This is more efficient than filtering post-UNWIND if Kuzu optimizer uses it.
+        # However, _apply_search_filters_to_query_basic might try to filter on r.type or r.label if SearchFilters supports it.
+        # For Kuzu, rel table names are fixed, so edge_types in SearchFilters should map to these.
+        # The current code uses a generic '*' in MATCH and filters later.
+        # Let's keep it simple for now and rely on post-UNWIND filtering for 'r' properties.
+
+        match_clause = f"MATCH (origin:Entity)-[rels{edge_type_str}*1..{bfs_max_depth} BFS]->(peer:Entity)"
+
+        # Filters applied to the relationship 'r' after UNWIND
+        # These are for properties *of the relationship itself*, not its type.
+        additional_r_filter_str = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+
+        # Building the query
+        # WITH clause is essential to make `r` available for WHERE and RETURN
+        # The WHERE clause here applies to `origin` and properties of `r`
+
+        # Start with base path match conditions
+        full_where_conditions = path_match_where_clauses.copy()
+
+        # Construct the final WHERE clause string for the main MATCH part
+        # This primarily includes origin.uuid IN $origin_uuids
+        # Any filters on 'r' will be applied *after* UNWIND if possible, or need to be part of the MATCH path pattern if Kuzu supports it well.
+        # For now, let's assume Kuzu applies WHERE after pathfinding but before UNWIND for path properties,
+        # and for 'r' properties specifically, we might need a separate WITH...WHERE post-UNWIND.
+        # Re-simplifying: Apply filters that can be applied to the MATCH path in its WHERE clause.
+        # Filters on individual 'r' from 'rels' list need to be handled carefully.
+        # The provided code structure `MATCH ... WHERE ... UNWIND ... WITH ... {final_where_clause}` for r filters is problematic.
+        # A more standard Cypher approach for filtering properties of `r` from an unwound list `rels`
+        # would be `... UNWIND rels as r WITH r WHERE condition_on_r ...`
+        # Or, if Kuzu allows filtering on path relationships directly: `MATCH p=(origin)-[...]-(peer) WHERE all(r IN relationships(p) WHERE r.property = value)`
+        # Given Kuzu's specifics, let's try to keep the main WHERE for `origin` and `peer` level filters.
+        # And apply `r` specific filters after UNWIND using a `WITH r WHERE ...` if needed.
+        # The current `_apply_search_filters_to_query_basic` on `r` will generate clauses like `r.property = value`.
+        # These should be applied after UNWIND.
+
+        # Initial match and origin filter
+        query_parts = [
+            f"{match_clause}",
+            "WHERE origin.uuid IN $origin_uuids", # Filter for origin nodes
+            "UNWIND rels AS r" # Unpack relationships from paths
+        ]
+
+        # Apply filters for 'r' after UNWIND
+        if additional_r_filter_str:
+            query_parts.append(f"WHERE {additional_r_filter_str}") # Filters on properties of 'r'
+
+        query_parts.append(
+            "RETURN DISTINCT r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, "
+            "r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, "
+            "startNode(r).uuid AS source_node_uuid, endNode(r).uuid AS target_node_uuid"
+        )
+        query_parts.append("LIMIT $lim")
+
+        query = "\n".join(query_parts)
 
         try:
             results, _, _ = await self.execute_query(query, params)
-            # Filter out results where r might be null if path is just one node (should not happen with *1..N)
             return [self._kuzudb_to_entity_edge(res) for res in results if res.get('uuid')]
         except Exception as e:
-            logger.error(f"edge_bfs_search failed: {e}")
+            logger.error(f"KuzuDB edge_bfs_search failed for origins {bfs_origin_node_uuids}: {e}. Query: {query}")
             return []
 
 
@@ -968,36 +1127,39 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
         if not bfs_origin_node_uuids: return []
 
-        edge_type_str = "*"
-        if search_filter and search_filter.edge_types:
+        params: Dict[str, Any] = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
+
+        # Edge type string for MATCH pattern
+        edge_type_str = "*" # Default: any relationship type
+        if search_filter.edge_types: # If specific edge types (rel tables) are given
             edge_type_str = ":" + "|".join(search_filter.edge_types)
 
-        # Collect distinct peer nodes found in paths up to max_depth
-        params = {"origin_uuids": bfs_origin_node_uuids, "lim": limit}
-        # Apply search_filter to properties of 'peer' (target node)
-        additional_where_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "peer", params)
+        # Base WHERE clauses for the MATCH pattern
+        # Filters on 'origin' node and ensures 'peer' is distinct
+        # Also apply additional filters from SearchFilters to the 'peer' node
 
-        # Base WHERE clause for BFS logic (origin filtering, distinct from peer)
-        base_where_clauses = ["origin.uuid IN $origin_uuids", "origin.uuid <> peer.uuid"]
+        where_clauses = ["origin.uuid IN $origin_uuids", "origin.uuid <> peer.uuid"]
 
-        if additional_where_clauses_str:
-            base_where_clauses.append(additional_where_clauses_str)
+        peer_filter_str = self._apply_search_filters_to_query_basic(search_filter, "peer", params)
+        if peer_filter_str:
+            where_clauses.append(peer_filter_str)
 
-        final_where_clause = "WHERE " + " AND ".join(base_where_clauses)
+        final_where_clause_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        match_clause = f"MATCH (origin:Entity)-[rels{edge_type_str}*1..{bfs_max_depth} BFS]->(peer:Entity)"
 
         query = f"""
-        MATCH (origin:Entity)-[rels*1..{bfs_max_depth} BFS]->(peer:Entity)
-        {final_where_clause}
+        {match_clause}
+        {final_where_clause_str}
         RETURN DISTINCT peer.uuid, peer.name, peer.group_id, peer.created_at, peer.summary, peer.name_embedding, peer.attributes
         LIMIT $lim
         """
-        # Assuming peer is EntityNode. If search_filter.node_labels specified other types, MATCH pattern would need change.
 
         try:
             results, _, _ = await self.execute_query(query, params)
             return [self._kuzudb_to_entity_node(res) for res in results]
         except Exception as e:
-            logger.error(f"node_bfs_search failed: {e}")
+            logger.error(f"KuzuDB node_bfs_search failed for origins {bfs_origin_node_uuids}: {e}. Query: {query}")
             return []
 
     async def episode_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[EpisodicNode]:
@@ -1007,11 +1169,15 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
         # Searching on 'name' and 'content' properties of EpisodicNode
         where_clauses = ["(CONTAINS(lower(e.name), $query_str_lower) OR CONTAINS(lower(e.content), $query_str_lower) OR CONTAINS(lower(e.source_description), $query_str_lower))"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("e.group_id IN $gids")
             params["gids"] = group_ids
 
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="e")
+        # Apply additional filters from SearchFilters object
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "e", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         cols = "e.uuid, e.name, e.group_id, e.source, e.source_description, e.content, e.valid_at, e.created_at, e.entity_edges"
         final_query = f"MATCH (e:Episodic) WHERE {' AND '.join(where_clauses)} RETURN {cols} LIMIT $limit_val"
@@ -1025,11 +1191,18 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
         # Searching on 'name' and 'summary' properties of CommunityNode
         where_clauses = ["(CONTAINS(lower(c.name), $query_str_lower) OR CONTAINS(lower(c.summary), $query_str_lower))"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("c.group_id IN $gids")
             params["gids"] = group_ids
 
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="c") # search_filter not passed here
+        # Apply additional filters from SearchFilters object
+        # Since community_fulltext_search doesn't take search_filter, we'd need to add it or use a default/empty one.
+        # For now, assuming it might be added or this part of filtering is skipped if no search_filter object is available.
+        # If search_filter were a param:
+        # filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
+        # if filter_query_part:
+        #     where_clauses.append(filter_query_part)
 
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols} LIMIT $limit_val"
@@ -1044,11 +1217,17 @@ class KuzuDBProvider(GraphDatabaseProvider):
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         # Ensure name_embedding is not null
         where_clauses = ["c.name_embedding IS NOT NULL", f"{KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) >= $min_s"]
-        if group_ids:
+
+        if group_ids: # group_ids from method parameter take precedence
             where_clauses.append("c.group_id IN $gids")
             params["gids"] = group_ids
 
-        # self._apply_search_filters_to_query_basic(where_clauses, params, search_filter, node_alias="c") # search_filter not passed here
+        # Apply additional filters from SearchFilters object
+        # Similar to community_fulltext_search, this method doesn't currently accept search_filter.
+        # If search_filter were a param:
+        # filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
+        # if filter_query_part:
+        #     where_clauses.append(filter_query_part)
 
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols}, {KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
@@ -1061,178 +1240,265 @@ class KuzuDBProvider(GraphDatabaseProvider):
             return []
 
     async def get_relevant_nodes(self, nodes: List[EntityNode], search_filter: SearchFilters, min_score: float, limit: int) -> List[List[EntityNode]]:
-        # This is a complex method. A basic interpretation: for each input node, find similar nodes.
-        # This might mean finding nodes with high embedding similarity.
-        # For now, iterate and call node_similarity_search for each node's embedding if available.
-        # search_filter and min_score apply to the similarity search.
-        if not self.connection or not nodes: return []
+        if not self.connection or not nodes: return [[] for _ in nodes] # Corrected return for empty input
 
         all_relevant_nodes: List[List[EntityNode]] = []
-        for node in nodes:
-            if node.name_embedding:
+        for node_ref in nodes: # Changed 'node' to 'node_ref' to avoid confusion with 'n' alias
+            if node_ref.name_embedding:
                 try:
-                    # Assuming group_ids for filtering might come from the node itself or search_filter
-                    group_ids_filter = [node.group_id] if node.group_id else None # Example
-                    # TODO: Refine group_ids_filter based on actual requirements or search_filter fields
+                    # node_similarity_search is already updated to use search_filter internally.
+                    # We pass the search_filter object to it.
+                    # The group_ids_filter here sets the explicit group_ids for the search,
+                    # which node_similarity_search will use. If search_filter.group_id_filter is also set,
+                    # node_similarity_search's _apply_search_filters_to_query_basic might add another
+                    # condition if not handled carefully. Assuming explicit group_ids take precedence.
+
+                    group_ids_for_search = [node_ref.group_id] if node_ref.group_id else None
+
+                    # If search_filter contains group_id_filter and group_ids_for_search is None,
+                    # it could potentially be used. However, typical use is per-node group context.
+                    # For now, the direct group_ids_for_search is the primary mechanism.
 
                     similar_nodes = await self.node_similarity_search(
-                        search_vector=node.name_embedding,
-                        search_filter=search_filter,
-                        group_ids=group_ids_filter, # Or from search_filter
+                        search_vector=node_ref.name_embedding,
+                        search_filter=search_filter, # Pass the main search_filter object
+                        group_ids=group_ids_for_search,
                         limit=limit,
                         min_score=min_score
                     )
                     # Filter out the input node itself from results
-                    all_relevant_nodes.append([n for n in similar_nodes if n.uuid != node.uuid])
+                    all_relevant_nodes.append([n for n in similar_nodes if n.uuid != node_ref.uuid])
                 except Exception as e:
-                    logger.error(f"Error finding relevant nodes for node {node.uuid}: {e}")
+                    logger.error(f"Error finding relevant nodes for node {node_ref.uuid}: {e}")
                     all_relevant_nodes.append([])
             else:
                 all_relevant_nodes.append([]) # No embedding to search with
         return all_relevant_nodes
 
-    async def get_relevant_edges(self, edges: List[EntityEdge], search_filter: SearchFilters, min_score: float, limit: int) -> List[List[EntityEdge]]:
-        # Similar to get_relevant_nodes, but for edges.
-        # Find edges with high fact_embedding similarity.
-        if not self.connection or not edges: return []
+    async def get_relevant_edges(
+        self,
+        edges: List[EntityEdge],
+        search_filter: SearchFilters, # type: ignore
+        min_score: float, # min_score for similarity search
+        limit: int,
+        rrf_k: int = 60 # Default RRF K value
+    ) -> List[List[EntityEdge]]:
+        if not self.connection or not edges:
+            return [[] for _ in edges]
 
-        all_relevant_edges: List[List[EntityEdge]] = []
+        all_results: List[List[EntityEdge]] = []
+        internal_search_limit = limit * 3 # Fetch more results internally
+
         for edge in edges:
+            edge_rrf_scores: Dict[str, float] = {}
+
+            # 1. Vector Search (Edge Similarity Search)
             if edge.fact_embedding:
                 try:
-                    group_ids_filter = [edge.group_id] if edge.group_id else None
-                    # TODO: Refine group_ids_filter
-
-                    similar_edges = await self.edge_similarity_search(
+                    vector_results = await self.edge_similarity_search(
                         search_vector=edge.fact_embedding,
-                        source_node_uuid=None, # Or edge.source_node_uuid if context matters
-                        target_node_uuid=None, # Or edge.target_node_uuid
+                        source_node_uuid=None, # General search, not tied to specific source/target
+                        target_node_uuid=None,
                         search_filter=search_filter,
-                        group_ids=group_ids_filter,
-                        limit=limit,
+                        group_ids=[edge.group_id] if edge.group_id else None,
+                        limit=internal_search_limit,
                         min_score=min_score
                     )
-                    all_relevant_edges.append([e for e in similar_edges if e.uuid != edge.uuid])
+                    for rank, res_edge in enumerate(vector_results):
+                        if res_edge.uuid == edge.uuid: # Exclude input edge
+                            continue
+                        edge_rrf_scores[res_edge.uuid] = edge_rrf_scores.get(res_edge.uuid, 0.0) + (1.0 / (rrf_k + rank + 1))
                 except Exception as e:
-                    logger.error(f"Error finding relevant edges for edge {edge.uuid}: {e}")
-                    all_relevant_edges.append([])
+                    logger.error(f"KuzuDB RRF Edges: Error during vector search for edge {edge.uuid}: {e}")
+
+            # 2. Full-text Search on Edge Fact
+            if edge.fact: # Or edge.name if 'fact' is not the primary text content for FTS
+                try:
+                    fts_results = await self.edge_fulltext_search(
+                        query=edge.fact, # Using 'fact' for FTS
+                        search_filter=search_filter,
+                        group_ids=[edge.group_id] if edge.group_id else None,
+                        limit=internal_search_limit
+                    )
+                    for rank, res_edge in enumerate(fts_results):
+                        if res_edge.uuid == edge.uuid: # Exclude input edge
+                            continue
+                        edge_rrf_scores[res_edge.uuid] = edge_rrf_scores.get(res_edge.uuid, 0.0) + (1.0 / (rrf_k + rank + 1))
+                except Exception as e:
+                    logger.error(f"KuzuDB RRF Edges: Error during full-text search for edge {edge.uuid}: {e}")
+
+            if not edge_rrf_scores:
+                all_results.append([])
+                continue
+
+            sorted_uuids = sorted(edge_rrf_scores.keys(), key=lambda u: edge_rrf_scores[u], reverse=True)
+            top_uuids = sorted_uuids[:limit]
+
+            if top_uuids:
+                final_edges_map = {e.uuid: e for e in await self.get_entity_edges_by_uuids(top_uuids)}
+                ordered_final_edges = [final_edges_map[uuid] for uuid in top_uuids if uuid in final_edges_map]
+                all_results.append(ordered_final_edges)
             else:
-                all_relevant_edges.append([])
-        return all_relevant_edges
+                all_results.append([])
 
-    async def get_edge_invalidation_candidates(self, edges: List[EntityEdge], search_filter: SearchFilters, min_score: float, limit: int) -> List[List[EntityEdge]]:
-        """
-        Identifies entity edges that are candidates for invalidation based on relevance or other criteria.
+        return all_results
 
-        NOTE: This is currently a placeholder implementation and mirrors `get_relevant_edges`.
-        The logic for determining "invalidation candidates" is typically domain-specific and
-        would require a more tailored implementation based on specific business rules
-        (e.g., edges that are old, have low usage, conflict with new information, etc.).
-
-        Parameters:
-            edges: A list of reference EntityEdge objects.
-            search_filter: SearchFilters to apply.
-            min_score: Minimum similarity score for an edge to be considered relevant (if using similarity).
-            limit: Maximum number of candidate edges to return per input edge.
-
-        Returns:
-            A list of lists, where each inner list contains candidate EntityEdge objects
-            for invalidation related to the corresponding input edge.
-        """
-        logger.warning(
-            "get_edge_invalidation_candidates is using get_relevant_edges logic as a placeholder. "
-            "Define specific business logic for invalidation candidates if needed."
-        )
-        # Placeholder: "Invalidation candidates" is domain-specific.
-        # A generic approach could be to find edges that are "semantically distant"
-        # from a set of reference edges, or perhaps edges whose connected nodes have changed significantly.
-        # This implementation currently mirrors get_relevant_edges.
-        # A more specific implementation would depend on the exact criteria for "invalidation".
-        return await self.get_relevant_edges(edges, search_filter, min_score, limit)
-
-    async def add_nodes_and_edges_bulk(
+    async def get_edge_invalidation_candidates(
         self,
-        episodic_nodes: List[EpisodicNode],
-        episodic_edges: List[EpisodicEdge],
-        entity_nodes: List[EntityNode],
-        entity_edges: List[EntityEdge],
-        embedder: EmbedderClient
-    ) -> None:
-        if not self.connection:
-            raise ConnectionError("KuzuDB connection not established.")
+        edges: List[EntityEdge],
+        search_filter: SearchFilters, # type: ignore
+        min_score: float, # Interpreted as max_score for dissimilarity
+        limit: int
+    ) -> List[List[EntityEdge]]:
+        if not self.connection or not edges:
+            return [[] for _ in edges]
 
-        logger.info(f"Starting bulk add: {len(episodic_nodes)} episodic nodes, {len(entity_nodes)} entity nodes, {len(episodic_edges)} episodic edges, {len(entity_edges)} entity edges.")
+        all_results: List[List[EntityEdge]] = []
+        # The min_score here is treated as a threshold for *low* similarity.
+        # We are looking for edges that are NOT similar to the input edge.
 
-        # 1. Generate Embeddings (outside transaction)
-        # Entity Nodes
-        for node in entity_nodes:
-            if node.name_embedding is None:
+        for edge_ref in edges:
+            candidate_edges: List[EntityEdge] = []
+            candidate_edge_uuids: Set[str] = set() # To avoid duplicates
+
+            # 1. Try to find dissimilar edges using vector search
+            # We'll fetch more than 'limit' initially, then filter by score.
+            # KuzuDB's current similarity search finds scores >= min_score.
+            # To find dissimilar ones, we'd ideally want scores < min_score.
+            # This is a bit tricky with current provider methods.
+            # Alternative: Fetch a broader set and filter client-side, or assume 'min_score' is a high bar
+            # and anything not meeting it (or not found by a high-threshold search) is a candidate.
+
+            # For now, let's assume we can't directly query "score < X".
+            # We will fetch relevant edges and then EXCLUDE those that are too similar if that's easier.
+            # Or, more simply, this method could just find OLD edges if similarity is not a good proxy for invalidation.
+
+            # Let's redefine: candidates are those *not* strongly similar OR are old.
+            # For simplicity, this initial update will focus on finding *older* edges,
+            # as querying for "dissimilarity" is complex without specific DB support.
+            # The 'min_score' parameter will be ignored in this simplified version.
+
+            logger.info(f"Edge invalidation for {edge_ref.uuid}: Finding older edges. 'min_score' param currently unused in this simplified version.")
+
+            # Fetch edges from the same group, ordering by creation time (oldest first)
+            # This is a simplified heuristic for "invalidation candidates".
+            # A more complex version might consider edges not recently accessed, or with conflicting facts.
+
+            # Formulate a query to get edges, ordered by created_at ASC.
+            # We need to ensure we don't pick the edge_ref itself.
+            # We should also ideally filter by group_id if available on edge_ref.
+
+            params: Dict[str, Any] = {"lim": limit + 1} # Fetch one more to check if edge_ref is among them
+            query_parts = [
+                "MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)",
+                "WHERE r.uuid <> $ref_uuid" # Exclude the reference edge itself
+            ]
+            params["ref_uuid"] = edge_ref.uuid
+
+            if edge_ref.group_id:
+                query_parts.append("AND r.group_id = $gid")
+                params["gid"] = edge_ref.group_id
+
+            # Applying search_filter (basic property filters on 'r')
+            filter_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "r", params)
+            if filter_clauses_str:
+                query_parts.append(f"AND {filter_clauses_str}")
+
+            # Return columns for EntityEdge
+            cols = "r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, s.uuid as source_node_uuid, t.uuid as target_node_uuid"
+            query = f"{' '.join(query_parts)} RETURN {cols} ORDER BY r.created_at ASC LIMIT $lim" # Oldest first
+
+            try:
+                older_edges_data, _, _ = await self.execute_query(query, params)
+                for data in older_edges_data:
+                    cand_edge = self._kuzudb_to_entity_edge(data)
+                    if cand_edge.uuid not in candidate_edge_uuids: # Should be redundant due to query limit
+                        candidate_edges.append(cand_edge)
+                        candidate_edge_uuids.add(cand_edge.uuid)
+                        if len(candidate_edges) >= limit:
+                            break
+            except Exception as e:
+                logger.error(f"KuzuDB Edge Invalidation: Error fetching older edges for {edge_ref.uuid}: {e}")
+
+            all_results.append(candidate_edges)
+
+        return all_results
+
+    async def get_relevant_nodes_rrf(
+        self,
+        nodes: List[EntityNode],
+        search_filter: SearchFilters, # type: ignore
+        limit: int,
+        rrf_k: int = 60, # Default RRF K value
+        similarity_min_score: float = 0.1 # Low threshold for similarity to get more candidates
+    ) -> List[List[EntityNode]]:
+        if not self.connection or not nodes:
+            return [[] for _ in nodes] # Return list of empty lists matching input structure
+
+        all_results: List[List[EntityNode]] = []
+        # Fetch more results internally for RRF to have a good pool of candidates
+        internal_search_limit = limit * 3 # Increased internal limit
+
+        for node in nodes:
+            node_rrf_scores: Dict[str, float] = {} # Store RRF scores for UUIDs
+            # Keep track of nodes fetched from searches to avoid re-fetching if possible,
+            # though RRF primarily works with UUIDs and ranks before final fetch.
+            # For simplicity, we'll fetch all top UUIDs at the end.
+
+            # 1. Vector Search (Node Similarity Search)
+            if node.name_embedding:
                 try:
-                    # Assuming EntityNode has a method to generate its own embedding
-                    # This method might be part of the Pydantic model itself or a utility.
-                    # For now, direct call as if it exists on the model.
-                    # await node.generate_name_embedding(embedder)
-                    # If generate_name_embedding is not on EntityNode, call embedder directly:
-                    text_to_embed = node.name.replace('\n', ' ')
-                    node.name_embedding = await embedder.create(input_data=[text_to_embed]) # Assuming embedder.create returns List[List[float]]
-                    if node.name_embedding and isinstance(node.name_embedding, list) and len(node.name_embedding) > 0 and isinstance(node.name_embedding[0], list): # type: ignore
-                        node.name_embedding = node.name_embedding[0] # type: ignore # Take the first embedding if create returns a list of embeddings
-                    logger.debug(f"Generated name embedding for EntityNode: {node.uuid}")
+                    vector_results = await self.node_similarity_search(
+                        search_vector=node.name_embedding,
+                        search_filter=search_filter,
+                        # Assuming search within the same group by default if group_id is present
+                        group_ids=[node.group_id] if node.group_id else None,
+                        limit=internal_search_limit,
+                        min_score=similarity_min_score # Use a potentially lower min_score for broader RRF input
+                    )
+                    for rank, res_node in enumerate(vector_results):
+                        if res_node.uuid == node.uuid:  # Exclude the input node itself
+                            continue
+                        node_rrf_scores[res_node.uuid] = node_rrf_scores.get(res_node.uuid, 0.0) + (1.0 / (rrf_k + rank + 1))
                 except Exception as e:
-                    logger.error(f"Failed to generate embedding for EntityNode {node.uuid}: {e}")
-                    # Decide if to proceed without embedding or raise error
+                    logger.error(f"KuzuDB RRF: Error during vector search for node {node.uuid}: {e}")
 
-        # Entity Edges
-        for edge in entity_edges:
-            if edge.fact_embedding is None:
+            # 2. Full-text Search
+            if node.name:
                 try:
-                    # await edge.generate_embedding(embedder) # Similar to EntityNode
-                    text_to_embed = edge.fact.replace('\n', ' ')
-                    edge.fact_embedding = await embedder.create(input_data=[text_to_embed])
-                    if edge.fact_embedding and isinstance(edge.fact_embedding, list) and len(edge.fact_embedding) > 0 and isinstance(edge.fact_embedding[0], list): # type: ignore
-                        edge.fact_embedding = edge.fact_embedding[0] # type: ignore
-                    logger.debug(f"Generated fact embedding for EntityEdge: {edge.uuid}")
+                    fts_results = await self.node_fulltext_search(
+                        query=node.name,
+                        search_filter=search_filter,
+                        group_ids=[node.group_id] if node.group_id else None,
+                        limit=internal_search_limit
+                    )
+                    for rank, res_node in enumerate(fts_results):
+                        if res_node.uuid == node.uuid:  # Exclude the input node itself
+                            continue
+                        node_rrf_scores[res_node.uuid] = node_rrf_scores.get(res_node.uuid, 0.0) + (1.0 / (rrf_k + rank + 1))
                 except Exception as e:
-                    logger.error(f"Failed to generate embedding for EntityEdge {edge.uuid}: {e}")
+                    logger.error(f"KuzuDB RRF: Error during full-text search for node {node.uuid}: {e}")
 
-        # KuzuDB does not support explicit BEGIN TRANSACTION / COMMIT via execute() in the same way as SQL DBs for multi-statement tx.
-        # Each execute call is often its own transaction.
-        # For a large batch, this means many small transactions.
-        # KuzuDB's COPY FROM command is the most efficient for bulk, but that requires CSV/Parquet.
-        # Iterative calls to single save methods is the fallback for API-driven bulk load.
-        
-        # 2. Node Creation
-        logger.info("Saving episodic nodes...")
-        for node in episodic_nodes:
-            try:
-                await self.save_episodic_node(node)
-            except Exception as e:
-                logger.error(f"Error saving episodic node {node.uuid} during bulk operation: {e}")
-                # Optionally, collect errors and continue, or re-raise
-        
-        logger.info("Saving entity nodes...")
-        for node in entity_nodes:
-            try:
-                await self.save_entity_node(node)
-            except Exception as e:
-                logger.error(f"Error saving entity node {node.uuid} during bulk operation: {e}")
+            # 3. Sort by RRF score and get top N UUIDs
+            if not node_rrf_scores:
+                all_results.append([])
+                continue
 
-        # 3. Edge Creation
-        logger.info("Saving episodic edges...")
-        for edge in episodic_edges:
-            try:
-                await self.save_episodic_edge(edge)
-            except Exception as e:
-                logger.error(f"Error saving episodic edge {edge.uuid} during bulk operation: {e}")
+            # Sort UUIDs based on their calculated RRF scores
+            sorted_uuids = sorted(node_rrf_scores.keys(), key=lambda u: node_rrf_scores[u], reverse=True)
+            top_uuids = sorted_uuids[:limit]
 
-        logger.info("Saving entity edges...")
-        for edge in entity_edges:
-            try:
-                await self.save_entity_edge(edge)
-            except Exception as e:
-                logger.error(f"Error saving entity edge {edge.uuid} during bulk operation: {e}")
-        
-        logger.info("Bulk add_nodes_and_edges operation completed for KuzuDB (iterative saves).")
-        return # Or return some summary like counts of success/failures
+            # 4. Fetch full node objects for the top UUIDs
+            if top_uuids:
+                final_nodes_map = {n.uuid: n for n in await self.get_entity_nodes_by_uuids(top_uuids)}
+                # Order the final nodes based on the sorted_uuids list to maintain RRF ranking
+                ordered_final_nodes = [final_nodes_map[uuid] for uuid in top_uuids if uuid in final_nodes_map]
+                all_results.append(ordered_final_nodes)
+            else:
+                all_results.append([])
+
+        return all_results
 
 ```
+
+[end of graphiti_core/providers/kuzudb_provider.py]
