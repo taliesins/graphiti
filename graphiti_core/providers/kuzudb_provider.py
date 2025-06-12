@@ -706,10 +706,9 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def node_similarity_search(self, search_vector: List[float], search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[EntityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
-        # Common examples: list_similarity(a, b), cosine_distance(a,b), etc.
-        # Adjust the function name and potentially the scoring (distance vs similarity) as needed.
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
+        # Assuming "cosine_similarity" is the target KuzuDB vector similarity function.
+        # Higher score is considered better.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity"
         
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         where_clauses = [f"{KUZU_SIMILARITY_FUNCTION}(n.name_embedding, $s_vec) >= $min_s"]
@@ -993,8 +992,8 @@ class KuzuDBProvider(GraphDatabaseProvider):
 
     async def edge_similarity_search(self, search_vector: List[float], source_node_uuid: Optional[str], target_node_uuid: Optional[str], search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[EntityEdge]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
+        # Assuming "cosine_similarity" is the target KuzuDB vector similarity function.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity"
 
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         match_clauses = ["MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)"]
@@ -1184,9 +1183,9 @@ class KuzuDBProvider(GraphDatabaseProvider):
         results, _, _ = await self.execute_query(final_query, params)
         return [self._kuzudb_to_episodic_node(res) for res in results]
 
-    async def community_fulltext_search(self, query: str, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[CommunityNode]:
+    async def community_fulltext_search(self, query: str, search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10) -> List[CommunityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # Current FTS uses case-insensitive CONTAINS. See node_fulltext_search for notes on advanced FTS.
+        # Current FTS uses case-insensitive CONTAINS.
         params: Dict[str, Any] = {"query_str_lower": query.lower(), "limit_val": limit}
 
         # Searching on 'name' and 'summary' properties of CommunityNode
@@ -1197,22 +1196,19 @@ class KuzuDBProvider(GraphDatabaseProvider):
             params["gids"] = group_ids
 
         # Apply additional filters from SearchFilters object
-        # Since community_fulltext_search doesn't take search_filter, we'd need to add it or use a default/empty one.
-        # For now, assuming it might be added or this part of filtering is skipped if no search_filter object is available.
-        # If search_filter were a param:
-        # filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
-        # if filter_query_part:
-        #     where_clauses.append(filter_query_part)
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols} LIMIT $limit_val"
         results, _, _ = await self.execute_query(final_query, params)
         return [self._kuzudb_to_community_node(res) for res in results]
 
-    async def community_similarity_search(self, search_vector: List[float], group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[CommunityNode]:
+    async def community_similarity_search(self, search_vector: List[float], search_filter: SearchFilters, group_ids: Optional[List[str]] = None, limit: int = 10, min_score: float = 0.6) -> List[CommunityNode]:
         if not self.connection: raise ConnectionError("KuzuDB connection not established.")
-        # FIXME: Verify KuzuDB's actual vector similarity function name and syntax.
-        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder - Assuming higher is better.
+        # Assuming "cosine_similarity" is the target KuzuDB vector similarity function.
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity"
 
         params: Dict[str, Any] = {"s_vec": search_vector, "lim": limit, "min_s": min_score}
         # Ensure name_embedding is not null
@@ -1223,11 +1219,9 @@ class KuzuDBProvider(GraphDatabaseProvider):
             params["gids"] = group_ids
 
         # Apply additional filters from SearchFilters object
-        # Similar to community_fulltext_search, this method doesn't currently accept search_filter.
-        # If search_filter were a param:
-        # filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
-        # if filter_query_part:
-        #     where_clauses.append(filter_query_part)
+        filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "c", params)
+        if filter_query_part:
+            where_clauses.append(filter_query_part)
 
         cols = "c.uuid, c.name, c.group_id, c.created_at, c.summary, c.name_embedding"
         final_query = f"MATCH (c:Community) WHERE {' AND '.join(where_clauses)} RETURN {cols}, {KUZU_SIMILARITY_FUNCTION}(c.name_embedding, $s_vec) AS score ORDER BY score DESC LIMIT $lim"
@@ -1353,72 +1347,60 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if not self.connection or not edges:
             return [[] for _ in edges]
 
+        KUZU_SIMILARITY_FUNCTION = "cosine_similarity" # Placeholder
         all_results: List[List[EntityEdge]] = []
-        # The min_score here is treated as a threshold for *low* similarity.
-        # We are looking for edges that are NOT similar to the input edge.
 
         for edge_ref in edges:
-            candidate_edges: List[EntityEdge] = []
-            candidate_edge_uuids: Set[str] = set() # To avoid duplicates
+            if not edge_ref.fact_embedding:
+                logger.warning(f"Edge {edge_ref.uuid} has no fact_embedding, skipping invalidation candidates search.")
+                all_results.append([])
+                continue
 
-            # 1. Try to find dissimilar edges using vector search
-            # We'll fetch more than 'limit' initially, then filter by score.
-            # KuzuDB's current similarity search finds scores >= min_score.
-            # To find dissimilar ones, we'd ideally want scores < min_score.
-            # This is a bit tricky with current provider methods.
-            # Alternative: Fetch a broader set and filter client-side, or assume 'min_score' is a high bar
-            # and anything not meeting it (or not found by a high-threshold search) is a candidate.
+            params: Dict[str, Any] = {
+                "edge_ref_uuid": edge_ref.uuid,
+                "edge_ref_fact_embedding": edge_ref.fact_embedding,
+                "source_ref_uuid": edge_ref.source_node_uuid,
+                "target_ref_uuid": edge_ref.target_node_uuid,
+                "min_s": min_score,
+                "lim": limit
+            }
 
-            # For now, let's assume we can't directly query "score < X".
-            # We will fetch relevant edges and then EXCLUDE those that are too similar if that's easier.
-            # Or, more simply, this method could just find OLD edges if similarity is not a good proxy for invalidation.
-
-            # Let's redefine: candidates are those *not* strongly similar OR are old.
-            # For simplicity, this initial update will focus on finding *older* edges,
-            # as querying for "dissimilarity" is complex without specific DB support.
-            # The 'min_score' parameter will be ignored in this simplified version.
-
-            logger.info(f"Edge invalidation for {edge_ref.uuid}: Finding older edges. 'min_score' param currently unused in this simplified version.")
-
-            # Fetch edges from the same group, ordering by creation time (oldest first)
-            # This is a simplified heuristic for "invalidation candidates".
-            # A more complex version might consider edges not recently accessed, or with conflicting facts.
-
-            # Formulate a query to get edges, ordered by created_at ASC.
-            # We need to ensure we don't pick the edge_ref itself.
-            # We should also ideally filter by group_id if available on edge_ref.
-
-            params: Dict[str, Any] = {"lim": limit + 1} # Fetch one more to check if edge_ref is among them
             query_parts = [
-                "MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)",
-                "WHERE r.uuid <> $ref_uuid" # Exclude the reference edge itself
+                "MATCH (n1:Entity)-[r_other:RELATES_TO]->(n2:Entity)",
+                "WHERE (n1.uuid = $source_ref_uuid OR n1.uuid = $target_ref_uuid OR n2.uuid = $source_ref_uuid OR n2.uuid = $target_ref_uuid)",
+                "AND r_other.uuid <> $edge_ref_uuid",
+                "AND r_other.fact_embedding IS NOT NULL"
             ]
-            params["ref_uuid"] = edge_ref.uuid
 
-            if edge_ref.group_id:
-                query_parts.append("AND r.group_id = $gid")
-                params["gid"] = edge_ref.group_id
+            if edge_ref.group_id: # Optional: filter by group_id
+                query_parts.append("AND r_other.group_id = $edge_ref_group_id")
+                params["edge_ref_group_id"] = edge_ref.group_id
 
-            # Applying search_filter (basic property filters on 'r')
-            filter_clauses_str = self._apply_search_filters_to_query_basic(search_filter, "r", params)
-            if filter_clauses_str:
-                query_parts.append(f"AND {filter_clauses_str}")
+            # Apply search_filter to r_other
+            filter_query_part = self._apply_search_filters_to_query_basic(search_filter, "r_other", params)
+            if filter_query_part:
+                query_parts.append(f"AND {filter_query_part}")
 
-            # Return columns for EntityEdge
-            cols = "r.uuid, r.name, r.group_id, r.fact, r.fact_embedding, r.episodes, r.created_at, r.expired_at, r.valid_at, r.invalid_at, r.attributes, s.uuid as source_node_uuid, t.uuid as target_node_uuid"
-            query = f"{' '.join(query_parts)} RETURN {cols} ORDER BY r.created_at ASC LIMIT $lim" # Oldest first
+            # Add similarity calculation and filtering
+            query_parts.append(f"WITH r_other, n1, n2, {KUZU_SIMILARITY_FUNCTION}(r_other.fact_embedding, $edge_ref_fact_embedding) AS score")
+            query_parts.append("WHERE score >= $min_s")
 
+            # Define return columns for EntityEdge, plus score
+            # Ensure n1 and n2 are used for source/target UUIDs based on r_other's direction.
+            # Kuzu's startNode() and endNode() are safer if direction is unknown or mixed.
+            # However, the MATCH clause (n1)-[r_other]->(n2) defines direction.
+            cols = "r_other.uuid, r_other.name, r_other.group_id, r_other.fact, r_other.fact_embedding, r_other.episodes, r_other.created_at, r_other.expired_at, r_other.valid_at, r_other.invalid_at, r_other.attributes, n1.uuid AS source_node_uuid, n2.uuid AS target_node_uuid, score"
+
+            query = f"{' '.join(query_parts)} RETURN {cols} ORDER BY score DESC LIMIT $lim"
+
+            candidate_edges: List[EntityEdge] = []
             try:
-                older_edges_data, _, _ = await self.execute_query(query, params)
-                for data in older_edges_data:
-                    cand_edge = self._kuzudb_to_entity_edge(data)
-                    if cand_edge.uuid not in candidate_edge_uuids: # Should be redundant due to query limit
-                        candidate_edges.append(cand_edge)
-                        candidate_edge_uuids.add(cand_edge.uuid)
-                        if len(candidate_edges) >= limit:
-                            break
+                results_data, _, _ = await self.execute_query(query, params)
+                for data in results_data:
+                    # The 'score' is available in 'data' if needed for logging or further client-side filtering
+                    candidate_edges.append(self._kuzudb_to_entity_edge(data))
             except Exception as e:
-                logger.error(f"KuzuDB Edge Invalidation: Error fetching older edges for {edge_ref.uuid}: {e}")
+                logger.error(f"KuzuDB Edge Invalidation: Error fetching candidates for edge {edge_ref.uuid}: {e}. Query: {query}")
 
             all_results.append(candidate_edges)
 

@@ -1,0 +1,17 @@
+# Check graphiti_core's pyproject.toml for the exact kuzu version if possible,
+# otherwise use a recent version.
+# For now, assuming a generic kuzu dependency.
+kuzu>=0.3.0
+# To access graphiti_core, if running this sample standalone,
+# it would need to be installed. If running within the project,
+# Python path might handle it. For a true example, assume it needs to be listed.
+# graphiti-core (This might need to be a relative path or installed from a package later)
+# For now, we'll assume graphiti_core is accessible in the Python path when the sample runs.
+# The Dockerfile will handle making graphiti_core available.
+# Required for pandas DataFrames in add_nodes_and_edges_bulk
+pandas>=1.0
+pyarrow>=1.0
+# Pydantic is a core dependency of graphiti-core, but good to list explicitly if sample app uses it heavily.
+# pydantic
+# Asyncio is part of standard library
+# logging is part of standard library

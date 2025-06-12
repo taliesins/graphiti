@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  kuzudb_service:
+    image: ghcr.io/kuzudb/kuzudb:latest
+    ports:
+      # KuzuDB is primarily embedded, but exposing a port is harmless if not used
+      # by this specific sample app, which uses Kuzu as a library.
+      # Some Kuzu setups might offer a server mode on a port like 8000, not 8080.
+      # For this embedded example, no port exposure from this service is strictly necessary for sample_app.
+      # - "8000:8000"
+    volumes:
+      # This volume is for persisting data if KuzuDB service itself was running a server
+      # and managing its own database files. For an embedded KuzuDB used by sample_app,
+      # this service is more of a placeholder or for future use if KuzuDB runs as a server.
+      # The actual database for this sample will be created by sample_app in its own volume.
+      - ./kuzu_sample_data:/kuzu_db_data
+    environment:
+      # This path is relevant if the KuzuDB image uses it to initialize a server instance.
+      # For embedded mode (library use), this is not directly used by the sample_app.
+      KUZU_EMBEDDED_DB_PATH: /kuzu_db_data/sample_graph.kuzu
+    container_name: kuzudb_sample_instance
+    # KuzuDB official Docker images might not run as a persistent server by default without args.
+    # For embedded usage by sample_app, this service doesn't need to do much.
+    # Adding a dummy command to keep it running if needed, or it can be omitted if
+    # the image itself handles persistence/backgrounding appropriately.
+    # command: ["sleep", "infinity"] # Keeps container running if image exits. Not always needed.
+
+  sample_app:
+    build:
+      context: ../../ # Build context is the root of the graphiti repository
+      dockerfile: ./examples/kuzudb_sample/Dockerfile
+    depends_on:
+      # While Kuzu is embedded in sample_app, depends_on is kept if kuzudb_service
+      # were to become a server model in the future or if other samples need it.
+      # For a purely embedded scenario where sample_app handles its own Kuzu lib,
+      # this dependency isn't strictly functional for DB access but doesn't hurt.
+      - kuzudb_service
+    environment:
+      # Path for the KuzuDB database file *inside the sample_app container*.
+      # KuzuDBProvider in sample_app.py will use this path.
+      KUZU_DB_PATH: /app/kuzu_db_volume/sample_database.kuzu
+      PYTHONUNBUFFERED: 1 # Useful for seeing logs immediately
+    volumes:
+      # Mounts a named volume 'app_kuzu_data_vol' to /app/kuzu_db_volume in the container.
+      # This ensures that the database created by the sample_app (via embedded Kuzu) persists.
+      - app_kuzu_data_vol:/app/kuzu_db_volume
+    command: python sample_app.py
+    container_name: kuzudb_sample_app_instance
+
+volumes:
+  app_kuzu_data_vol: # Defines the named volume for sample_app's Kuzu database
+    # driver: local # Default, can be omitted.
+  # kuzu_sample_data: {} # Not strictly needed if kuzu_sample_data is just a bind mount path.
+                       # Using a bind mount like ./kuzu_sample_data:/kuzu_db_data is simpler for local dev.
+                       # If kuzu_sample_data was meant to be a named volume, it'd be defined here too.
+                       # The current setup for kuzudb_service uses a bind mount.
