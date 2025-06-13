@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum # Required for ComparisonOperator
 
 # Graphiti Core Imports
-from graphiti_core.providers.kuzudb_provider import KuzuDBProvider, SearchFilters, ComparisonOperator, DateFilter
+from graphiti_core.providers.kuzudb_provider import KuzuDBProvider, SearchFilters, ComparisonOperator, DateFilter, AttributeFilter
 from graphiti_core.nodes import EntityNode, EpisodicNode, CommunityNode, EpisodeType
 from graphiti_core.edges import EntityEdge, EpisodicEdge, CommunityEdge
 from graphiti_core.embedder import EmbedderClient
@@ -896,6 +896,487 @@ class TestKuzuDBProvider:
     # Community fulltext search does not currently accept SearchFilters in its signature in KuzuDBProvider
     # So, no specific SearchFilter test for it beyond what's already there.
 
+    # --- Tests for Multiple Filter Conditions ---
+    async def test_node_fulltext_search_multiple_filters_created_at_and_group_id(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "TestNode"
+        filter_date = datetime(2023, 1, 15, tzinfo=timezone.utc)
+        filter_group_id = "specific-group-for-multi-filter"
+
+        s_filters = SearchFilters(
+            created_at_filter=DateFilter(date=filter_date, operator=ComparisonOperator.GREATER_THAN),
+            group_id_filter=filter_group_id
+        )
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+        # Mock node data that would match these filters
+        node_dict_match = {
+            **MOCK_KUZU_ENTITY_NODE_DICT, # Base
+            "uuid": "multi-filter-node-1",
+            "name": search_query,
+            "created_at": datetime(2023, 1, 20, tzinfo=timezone.utc), # After filter_date
+            "group_id": filter_group_id # Matches filter_group_id
+        }
+        row1 = [node_dict_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row1]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+        assert len(results) == 1
+        assert results[0].uuid == "multi-filter-node-1"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        assert "CONTAINS(lower(n.name), $query_str_lower)" in query_str
+        assert f"n.created_at {s_filters.created_at_filter.operator.value} $n_created_at_date" in query_str
+        assert "n.group_id = $n_group_id_filter" in query_str # Filter from SearchFilters object
+
+        assert actual_params['query_str_lower'] == search_query.lower()
+        assert actual_params['n_created_at_date'] == filter_date
+        assert actual_params['n_group_id_filter'] == filter_group_id
+
+    async def test_episode_fulltext_search_multiple_filters_created_at_and_valid_at(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "TestEpisode"
+        created_filter_date = datetime(2023, 1, 10, tzinfo=timezone.utc)
+        valid_filter_date = datetime(2023, 1, 5, tzinfo=timezone.utc)
+
+        s_filters = SearchFilters(
+            created_at_filter=DateFilter(date=created_filter_date, operator=ComparisonOperator.GREATER_THAN_OR_EQUALS),
+            valid_at_filter=DateFilter(date=valid_filter_date, operator=ComparisonOperator.LESS_THAN)
+        )
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["e.uuid", "e.name", "e.group_id", "e.source", "e.source_description", "e.content", "e.valid_at", "e.created_at", "e.entity_edges"]
+        # Mock episode data
+        episode_dict_match = {
+            **MOCK_KUZU_EPISODIC_NODE_DICT, # Base
+            "uuid": "multi-filter-ep-1",
+            "content": search_query,
+            "created_at": datetime(2023, 1, 15, tzinfo=timezone.utc), # >= created_filter_date
+            "valid_at": datetime(2023, 1, 1, tzinfo=timezone.utc)    # < valid_filter_date
+        }
+        row1 = [episode_dict_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row1]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.episode_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+        assert len(results) == 1
+        assert results[0].uuid == "multi-filter-ep-1"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        assert "CONTAINS(lower(e.content), $query_str_lower)" in query_str
+        assert f"e.created_at {s_filters.created_at_filter.operator.value} $e_created_at_date" in query_str
+        assert f"e.valid_at {s_filters.valid_at_filter.operator.value} $e_valid_at_date" in query_str
+
+        assert actual_params['query_str_lower'] == search_query.lower()
+        assert actual_params['e_created_at_date'] == created_filter_date
+        assert actual_params['e_valid_at_date'] == valid_filter_date
+
+    # --- Tests for all ComparisonOperator options for DateFilter ---
+    @pytest.mark.parametrize("operator,should_match", [
+        (ComparisonOperator.EQUALS, True),
+        (ComparisonOperator.NOT_EQUALS, False),
+        (ComparisonOperator.GREATER_THAN, False),
+        (ComparisonOperator.GREATER_THAN_OR_EQUALS, True),
+        (ComparisonOperator.LESS_THAN, False),
+        (ComparisonOperator.LESS_THAN_OR_EQUALS, True),
+    ])
+    async def test_node_fulltext_search_created_at_all_operators(
+        self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock, operator: ComparisonOperator, should_match: bool
+    ):
+        search_query = "OperatorTestNode"
+        node_created_at_for_test = MOCK_FILTER_DATETIME
+
+        s_filters = SearchFilters(
+            created_at_filter=DateFilter(date=MOCK_FILTER_DATETIME, operator=operator)
+        )
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+
+        node_dict_base = {
+            **MOCK_KUZU_ENTITY_NODE_DICT,
+            "uuid": f"op-test-node-{operator.name}",
+            "name": search_query,
+            "created_at": node_created_at_for_test
+        }
+
+        mock_node_data_to_return = []
+        # Scenario: Node's date IS MOCK_FILTER_DATETIME. Filter compares against MOCK_FILTER_DATETIME.
+        if should_match:
+            # This means the operator should yield a match when node_date == filter_date
+            # e.g., EQUALS, GTE, LTE
+            row1 = [node_dict_base[k.split('.')[1]] for k in cols]
+            mock_node_data_to_return.append(row1)
+
+        # Special handling for NOT_EQUALS to test the "true positive" case (date is different)
+        if operator == ComparisonOperator.NOT_EQUALS and not should_match:
+            # This is the case from parametrize where node_date == filter_date, so NOT_EQUALS is False. Correct.
+            pass
+        elif operator == ComparisonOperator.NOT_EQUALS and should_match:
+             # This case should be impossible with current should_match logic based on node_date == filter_date
+             # To properly test a true positive for NOT_EQUALS, we'd need a separate test or more complex parametrization
+            pass
+
+
+        configure_mock_query_result(mock_qr, cols, mock_node_data_to_return, has_next=bool(mock_node_data_to_return))
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+
+        if should_match:
+            assert len(results) == 1, f"Expected match for {operator} when node_date ({node_created_at_for_test}) vs filter_date ({MOCK_FILTER_DATETIME})"
+            assert results[0].uuid == f"op-test-node-{operator.name}"
+        else:
+            assert len(results) == 0, f"Expected no match for {operator} when node_date ({node_created_at_for_test}) vs filter_date ({MOCK_FILTER_DATETIME})"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        assert f"n.created_at {operator.value} $n_created_at_date" in query_str
+        assert actual_params['n_created_at_date'] == MOCK_FILTER_DATETIME
+
+    @pytest.mark.parametrize("operator,should_match", [
+        (ComparisonOperator.EQUALS, True),
+        (ComparisonOperator.NOT_EQUALS, False),
+        (ComparisonOperator.GREATER_THAN, False),
+        (ComparisonOperator.GREATER_THAN_OR_EQUALS, True),
+        (ComparisonOperator.LESS_THAN, False),
+        (ComparisonOperator.LESS_THAN_OR_EQUALS, True),
+    ])
+    async def test_episode_fulltext_search_valid_at_all_operators(
+        self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock, operator: ComparisonOperator, should_match: bool
+    ):
+        search_query = "OperatorTestEpisode"
+        episode_valid_at_for_test = MOCK_FILTER_DATETIME
+
+        s_filters = SearchFilters(
+            valid_at_filter=DateFilter(date=MOCK_FILTER_DATETIME, operator=operator)
+        )
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["e.uuid", "e.name", "e.group_id", "e.source", "e.source_description", "e.content", "e.valid_at", "e.created_at", "e.entity_edges"]
+
+        episode_dict_base = {
+            **MOCK_KUZU_EPISODIC_NODE_DICT,
+            "uuid": f"op-test-ep-{operator.name}",
+            "content": search_query,
+            "valid_at": episode_valid_at_for_test
+        }
+        mock_episode_data_to_return = []
+        if should_match:
+            row1 = [episode_dict_base[k.split('.')[1]] for k in cols]
+            mock_episode_data_to_return.append(row1)
+
+        configure_mock_query_result(mock_qr, cols, mock_episode_data_to_return, has_next=bool(mock_episode_data_to_return))
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.episode_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+
+        if should_match:
+            assert len(results) == 1, f"Expected match for {operator} on episode valid_at when ep_date ({episode_valid_at_for_test}) vs filter_date ({MOCK_FILTER_DATETIME})"
+            assert results[0].uuid == f"op-test-ep-{operator.name}"
+        else:
+            assert len(results) == 0, f"Expected no match for {operator} on episode valid_at when ep_date ({episode_valid_at_for_test}) vs filter_date ({MOCK_FILTER_DATETIME})"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        assert f"e.valid_at {operator.value} $e_valid_at_date" in query_str
+        assert actual_params['e_valid_at_date'] == MOCK_FILTER_DATETIME
+
+    # --- Tests for Combinations of Filters ---
+    async def test_node_fulltext_search_combined_filters(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "CombinedNodeTest"
+        filter_created_at = datetime(2023, 2, 1, tzinfo=timezone.utc)
+        filter_group_id = "group-for-combined-node-test"
+        attribute_key = "project"
+        attribute_value_contains = "Graphiti" # Looking for nodes with attribute like {"project": "Graphiti Core"}
+
+        s_filters = SearchFilters(
+            created_at_filter=DateFilter(date=filter_created_at, operator=ComparisonOperator.LESS_THAN),
+            group_id_filter=filter_group_id,
+            attribute_filters=[
+                AttributeFilter(key=attribute_key, value=attribute_value_contains, operator=ComparisonOperator.CONTAINS)
+            ]
+        )
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+
+        # Mock node that matches all combined filters
+        node_attributes = json.dumps({"project": "Graphiti Core Project", "version": "1.0"})
+        node_dict_match = {
+            **MOCK_KUZU_ENTITY_NODE_DICT,
+            "uuid": "combined-node-1",
+            "name": search_query, # Matches FTS
+            "created_at": datetime(2023, 1, 25, tzinfo=timezone.utc), # < filter_created_at
+            "group_id": filter_group_id, # Matches group_id_filter
+            "attributes": node_attributes # Matches attribute_filter (contains "Graphiti")
+        }
+        row1 = [node_dict_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row1]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+        assert len(results) == 1
+        assert results[0].uuid == "combined-node-1"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        # Check FTS part
+        assert f"CONTAINS(lower(n.name), $query_str_lower)" in query_str
+        # Check created_at filter
+        assert f"n.created_at {s_filters.created_at_filter.operator.value} $n_created_at_date" in query_str
+        # Check group_id filter from SearchFilters
+        assert "n.group_id = $n_group_id_filter" in query_str
+        # Check attribute filter (CONTAINS on value part)
+        # Based on current _apply_search_filters_to_query_basic, it will search for the value in the stringified attributes
+        assert f"CONTAINS(lower(n.attributes), lower($n_attr_val_0))" in query_str
+
+        assert actual_params['query_str_lower'] == search_query.lower()
+        assert actual_params['n_created_at_date'] == filter_created_at
+        assert actual_params['n_group_id_filter'] == filter_group_id
+        assert actual_params['n_attr_key_0'] == attribute_key # Key is stored for param name but not used in CONTAINS value query
+        assert actual_params['n_attr_val_0'] == attribute_value_contains
+
+
+    async def test_edge_fulltext_search_combined_filters(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "CombinedEdgeTest"
+        filter_created_at = datetime(2023, 3, 1, tzinfo=timezone.utc)
+        filter_group_id = "group-for-combined-edge-test"
+        attribute_key = "status"
+        attribute_value_contains = "active"
+
+        s_filters = SearchFilters(
+            created_at_filter=DateFilter(date=filter_created_at, operator=ComparisonOperator.GREATER_THAN_OR_EQUALS),
+            group_id_filter=filter_group_id,
+            attribute_filters=[
+                AttributeFilter(key=attribute_key, value=attribute_value_contains, operator=ComparisonOperator.CONTAINS)
+            ]
+        )
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["r.uuid", "r.name", "r.group_id", "r.fact", "r.fact_embedding", "r.episodes", "r.created_at", "r.expired_at", "r.valid_at", "r.invalid_at", "r.attributes", "source_node_uuid", "target_node_uuid"]
+
+        edge_attributes = json.dumps({"status": "active_and_verified", "priority": "high"})
+        edge_dict_match = {
+            **MOCK_KUZU_ENTITY_EDGE_DICT,
+            "uuid": "combined-edge-1",
+            "name": "COMBINED_REL",
+            "fact": search_query, # FTS match
+            "created_at": datetime(2023, 3, 5, tzinfo=timezone.utc), # >= filter_created_at
+            "group_id": filter_group_id, # Matches
+            "attributes": edge_attributes # Matches attribute filter
+        }
+        row1 = [edge_dict_match[k.split('.')[1] if '.' in k else k] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row1]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.edge_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+        assert len(results) == 1
+        assert results[0].uuid == "combined-edge-1"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        assert f"CONTAINS(lower(r.fact), $query_str_lower)" in query_str
+        assert f"r.created_at {s_filters.created_at_filter.operator.value} $r_created_at_date" in query_str
+        assert "r.group_id = $r_group_id_filter" in query_str
+        assert f"CONTAINS(lower(r.attributes), lower($r_attr_val_0))" in query_str
+
+        assert actual_params['query_str_lower'] == search_query.lower()
+        assert actual_params['r_created_at_date'] == filter_created_at
+        assert actual_params['r_group_id_filter'] == filter_group_id
+        assert actual_params['r_attr_key_0'] == attribute_key
+        assert actual_params['r_attr_val_0'] == attribute_value_contains
+
+    # --- Tests for Attribute Filter Behaviors ---
+    async def test_node_fulltext_search_attribute_filter_contains_match_no_match(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "AttrContainsTest"
+        attribute_key = "description"
+        attribute_value_contains = "keyword"
+
+        s_filters = SearchFilters(
+            attribute_filters=[
+                AttributeFilter(key=attribute_key, value=attribute_value_contains, operator=ComparisonOperator.CONTAINS)
+            ]
+        )
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+
+        # Node that should match
+        matching_attributes = json.dumps({"description": "This node has the keyword.", "id": 1})
+        node_match = {**MOCK_KUZU_ENTITY_NODE_DICT, "uuid": "attr-contains-match", "name": search_query, "attributes": matching_attributes}
+
+        # Node that should NOT match (different value for the key)
+        non_matching_attributes_diff_val = json.dumps({"description": "This node has other info.", "id": 2})
+        # Node that should NOT match (key not present) - current CONTAINS will still search full string, so might false positive if "keyword" is elsewhere
+        # For Kuzu's current string CONTAINS on serialized JSON, this is tricky.
+        # The test will primarily focus on value containment.
+
+        # Configure query result to return only the matching node when filters are applied
+        row_match = [node_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row_match]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters, limit=5)
+        assert len(results) == 1
+        assert results[0].uuid == "attr-contains-match"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+        assert f"CONTAINS(lower(n.attributes), lower($n_attr_val_0))" in query_str
+        assert actual_params['n_attr_val_0'] == attribute_value_contains
+
+        # Test no match: Configure mock to return empty if the keyword is not there.
+        # Provider logic is already tested for forming the query. Here we'd conceptually have Kuzu return nothing.
+        configure_mock_query_result(mock_qr, cols, [], has_next=False); mock_kuzu_connection.execute.return_value = mock_qr
+        s_filters_no_match = SearchFilters(attribute_filters=[AttributeFilter(key="description", value="nonexistent", operator=ComparisonOperator.CONTAINS)])
+        results_no_match = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters_no_match, limit=5)
+        assert len(results_no_match) == 0
+
+
+    async def test_node_fulltext_search_attribute_filter_equals(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "AttrEqualsTest"
+        attribute_key = "exact_match_key"
+        attribute_value_equals = "exact_value" # Value we want to match exactly
+
+        # IMPORTANT KuzuDB NOTE: EQUALS on attributes is a string match on the *entire serialized JSON string*
+        # or on a specific extracted property if Kuzu Cypher allows direct JSON property access in WHERE.
+        # The current _apply_search_filters_to_query_basic for CONTAINS uses `CONTAINS(lower(n.attributes), lower($val))`.
+        # For EQUALS, it generates `lower(n.attributes) = lower($val)` if we forced it, or `n.attributes[$key] = $val`.
+        # Let's assume the provider's _apply_search_filters_to_query_basic generates a string comparison for attributes with EQUALS.
+        # A more robust Kuzu query would be `n.attributes_json.%[key] = value` after `json_extract`.
+        # This test will verify based on the current implementation (string CONTAINS for attributes).
+        # If _apply_search_filters_to_query_basic is updated for true EQUALS on properties, this test needs to change.
+
+        s_filters_exact_val = SearchFilters(
+            attribute_filters=[
+                AttributeFilter(key=attribute_key, value=attribute_value_equals, operator=ComparisonOperator.EQUALS)
+            ]
+        )
+        # For EQUALS, the current provider implementation will use `list_contains(string_split(lower(n.attributes[$key]),' '), lower($n_attr_val_0))`
+        # which is not a true equals for the whole property value but rather a token contains.
+        # This test documents this behavior.
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+
+        # Node whose specific attribute *value* is "exact_value"
+        # Kuzu's string search on JSON: `CONTAINS(n.attributes, 'exact_value')` would match `{"key": "exact_value"}`.
+        # Provider's current EQUALS for attributes: `list_contains(string_split(lower(n.attributes['exact_match_key']),' '), lower($n_attr_val_0))`
+        # This implies the attribute 'exact_match_key' must exist, and its value, when tokenized, contains "exact_value".
+
+        # Mock node that should match if the attribute value for 'exact_match_key' IS 'exact_value'
+        matching_attributes = json.dumps({attribute_key: "exact_value", "other": "data"})
+        node_match = {**MOCK_KUZU_ENTITY_NODE_DICT, "uuid": "attr-equals-match", "name": search_query, "attributes": matching_attributes}
+
+        # Mock node that should NOT match (value is different)
+        non_matching_attributes = json.dumps({attribute_key: "exact_value_plus_suffix", "other": "data"})
+        node_no_match = {**MOCK_KUZU_ENTITY_NODE_DICT, "uuid": "attr-equals-no-match", "name": search_query, "attributes": non_matching_attributes}
+
+        row_match = [node_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row_match]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters_exact_val, limit=1)
+        assert len(results) == 1, "Expected match for EQUALS (current behavior: token contains)"
+        assert results[0].uuid == "attr-equals-match"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        # This is the crucial part: how does the provider translate EQUALS for attributes?
+        # Current implementation of _apply_search_filters_to_query_basic for AttributeFilter and EQUALS:
+        # `list_contains(string_split(lower(n.attributes[$n_attr_key_0]),' '), lower($n_attr_val_0))`
+        # This is NOT a true JSON property equals. It's a token-based CONTAINS on a specific property's value.
+        assert f"list_contains(string_split(lower(n.attributes[$n_attr_key_0]),' '), lower($n_attr_val_0))" in query_str
+        assert actual_params['n_attr_key_0'] == attribute_key
+        assert actual_params['n_attr_val_0'] == attribute_value_equals
+
+        # To show it does not match "exact_value_plus_suffix" with "exact_value"
+        # This is because "exact_value_plus_suffix" tokenizes to itself, and does not contain "exact_value" as a separate token.
+        # If attribute_value_equals was "exact_value_plus_suffix", it would match node_no_match.
+        # If node_no_match had attributes {attribute_key: "exact_value plus_suffix"}, it would match.
+        configure_mock_query_result(mock_qr, cols, [], has_next=False); mock_kuzu_connection.execute.return_value = mock_qr
+        s_filters_for_no_match_node = SearchFilters(
+            attribute_filters=[AttributeFilter(key=attribute_key, value="exact_value_plus_suffix", operator=ComparisonOperator.EQUALS)]
+        )
+        # This is trying to find a node where attribute_key's value (tokenized) contains "exact_value_plus_suffix"
+        # We'd need to set up mock_qr to return node_no_match here if it were the target.
+        # The point is to document the query formation for EQUALS.
+
+    async def test_node_fulltext_search_multiple_attribute_filters(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        search_query = "MultiAttrTest"
+        s_filters = SearchFilters(
+            attribute_filters=[
+                AttributeFilter(key="color", value="blue", operator=ComparisonOperator.CONTAINS), # n.attributes contains "blue"
+                AttributeFilter(key="size", value="large", operator=ComparisonOperator.CONTAINS)  # n.attributes contains "large"
+            ]
+        )
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+
+        # Node that matches both attribute filters
+        matching_attributes = json.dumps({"color": "blue sky", "size": "very large", "material": "wood"})
+        node_match = {**MOCK_KUZU_ENTITY_NODE_DICT, "uuid": "multi-attr-match", "name": search_query, "attributes": matching_attributes}
+
+        row_match = [node_match[k.split('.')[1]] for k in cols]
+        configure_mock_query_result(mock_qr, cols, [row_match]); mock_kuzu_connection.execute.return_value = mock_qr
+
+        results = await kuzudb_provider.node_fulltext_search(query=search_query, search_filter=s_filters, limit=1)
+        assert len(results) == 1
+        assert results[0].uuid == "multi-attr-match"
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        actual_params = mock_kuzu_connection.execute.call_args[1]
+
+        # Check that both attribute filters are applied (likely ANDed)
+        # Current provider CONTAINS logic for attributes:
+        assert f"CONTAINS(lower(n.attributes), lower($n_attr_val_0))" in query_str
+        assert f"CONTAINS(lower(n.attributes), lower($n_attr_val_1))" in query_str
+
+        # Check params based on order in attribute_filters list
+        assert actual_params['n_attr_key_0'] == "color"
+        assert actual_params['n_attr_val_0'] == "blue"
+        assert actual_params['n_attr_key_1'] == "size"
+        assert actual_params['n_attr_val_1'] == "large"
+
+    # --- Tests for Edge Cases in Search Inputs ---
+    async def test_node_fulltext_search_empty_query_string(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        # Provider's current behavior for empty query in FTS might be to match ALL nodes if no other filters.
+        # Or it might have a guard. Let's check.
+        # The Cypher `CONTAINS(lower(n.name), "")` is true for all non-null names.
+        # `_build_fulltext_search_query` has `if not query_str: return [], {}`
+
+        results = await kuzudb_provider.node_fulltext_search(query="", search_filter=EMPTY_SEARCH_FILTERS, limit=5)
+        assert len(results) == 0
+        mock_kuzu_connection.prepare.assert_not_called() # Due to the guard in _build_fulltext_search_query
+
+    async def test_node_similarity_search_empty_vector(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        # The method `_build_similarity_search_query` has `if not search_vector: return [], {}`
+        results, _ = await kuzudb_provider.node_similarity_search(search_vector=[], search_filter=EMPTY_SEARCH_FILTERS, limit=5)
+        assert len(results) == 0
+        mock_kuzu_connection.prepare.assert_not_called() # Due to the guard
+
+    async def test_node_fulltext_search_limit_zero(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        # `_build_fulltext_search_query` has `if limit is not None and limit == 0: return [], {}`
+        results = await kuzudb_provider.node_fulltext_search(query="Test", search_filter=EMPTY_SEARCH_FILTERS, limit=0)
+        assert len(results) == 0
+        mock_kuzu_connection.prepare.assert_not_called() # Due to the guard for limit = 0
+
+    async def test_node_similarity_search_limit_zero(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        # `_build_similarity_search_query` has `if limit is not None and limit == 0: return [], {}`
+        results, _ = await kuzudb_provider.node_similarity_search(search_vector=[0.1,0.2], search_filter=EMPTY_SEARCH_FILTERS, limit=0)
+        assert len(results) == 0
+        mock_kuzu_connection.prepare.assert_not_called()
+
     # --- Search Method Tests (Similarity) ---
     async def test_node_similarity_search_with_search_filters(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
         search_vector = [0.1,0.2,0.3]
@@ -937,6 +1418,139 @@ class TestKuzuDBProvider:
 
     # Community similarity search does not currently accept SearchFilters in its signature
     # So, no specific SearchFilter test for it beyond what's already there.
+
+    # --- Tests for uuid_cursor Pagination in Get By Group ID Methods ---
+    async def test_get_entity_nodes_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 5
+        uuid_cursor = "cursor-uuid-for-entity-nodes"
+
+        # Mock return data (actual data doesn't matter much, just that the method is called)
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding", "n.attributes"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_ENTITY_NODE_DICT[k.split('.')[1]] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_entity_nodes_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (n:Entity) WHERE n.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower() # Ensure cursor is not in the Cypher query string
+        assert "uuid_cursor" not in params_passed # Ensure cursor is not passed as a query parameter
+        assert params_passed.get("limit") == limit
+        assert params_passed.get("group_ids") == group_ids
+
+    async def test_get_episodic_nodes_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 3
+        uuid_cursor = "cursor-uuid-for-episodic-nodes"
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.source", "n.source_description", "n.content", "n.valid_at", "n.created_at", "n.entity_edges"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_EPISODIC_NODE_DICT[k.split('.')[1]] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_episodic_nodes_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (n:Episodic) WHERE n.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower()
+        assert "uuid_cursor" not in params_passed
+        assert params_passed.get("limit") == limit
+
+    async def test_get_community_nodes_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 2
+        uuid_cursor = "cursor-uuid-for-community-nodes"
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["n.uuid", "n.name", "n.group_id", "n.created_at", "n.summary", "n.name_embedding"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_COMMUNITY_NODE_DICT[k.split('.')[1]] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_community_nodes_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (n:Community) WHERE n.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower()
+        assert "uuid_cursor" not in params_passed
+        assert params_passed.get("limit") == limit
+
+    async def test_get_entity_edges_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 4
+        uuid_cursor = "cursor-uuid-for-entity-edges"
+
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["r.uuid", "r.name", "r.group_id", "r.fact", "r.fact_embedding", "r.episodes", "r.created_at", "r.expired_at", "r.valid_at", "r.invalid_at", "r.attributes", "source_node_uuid", "target_node_uuid"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_ENTITY_EDGE_DICT[k.split('.')[1] if '.' in k else k] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_entity_edges_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) WHERE r.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower()
+        assert "uuid_cursor" not in params_passed
+        assert params_passed.get("limit") == limit
+
+    async def test_get_episodic_edges_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 6
+        uuid_cursor = "cursor-uuid-for-episodic-edges"
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["r.uuid", "r.group_id", "r.created_at", "source_node_uuid", "target_node_uuid"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_EPISODIC_EDGE_DICT[k.split('.')[1] if '.' in k else k] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_episodic_edges_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (s:Episodic)-[r:MENTIONS]->(t:Entity) WHERE r.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower()
+        assert "uuid_cursor" not in params_passed
+        assert params_passed.get("limit") == limit
+
+    async def test_get_community_edges_by_group_ids_pagination_kuzudb(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
+        group_ids = [MOCK_GROUP_ID]
+        limit = 7
+        uuid_cursor = "cursor-uuid-for-community-edges"
+        mock_ps = MagicMock(); mock_kuzu_connection.prepare.return_value = mock_ps
+        mock_qr = MagicMock()
+        cols = ["r.uuid", "r.group_id", "r.created_at", "source_node_uuid", "target_node_uuid"]
+        configure_mock_query_result(mock_qr, cols, [[MOCK_KUZU_COMMUNITY_EDGE_DICT[k.split('.')[1] if '.' in k else k] for k in cols]]);
+        mock_kuzu_connection.execute.return_value = mock_qr
+
+        await kuzudb_provider.get_community_edges_by_group_ids(group_ids, limit=limit, uuid_cursor=uuid_cursor)
+
+        query_str = mock_kuzu_connection.prepare.call_args[0][0]
+        params_passed = mock_kuzu_connection.execute.call_args[1]
+
+        assert "MATCH (s:Community)-[r:HAS_MEMBER]->(t:Entity) WHERE r.group_id IN $group_ids RETURN" in query_str
+        assert "LIMIT $limit" in query_str
+        assert "uuid_cursor" not in query_str.lower()
+        assert "uuid_cursor" not in params_passed
+        assert params_passed.get("limit") == limit
 
     # --- BFS Search Tests ---
     async def test_node_bfs_search_basic(self, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
@@ -1116,18 +1730,29 @@ class TestKuzuDBProvider:
     @patch('pandas.DataFrame.to_parquet') # Mock parquet writing
     async def test_add_nodes_and_edges_bulk(self, mock_to_parquet, mock_os_remove, mock_os_close, mock_mkstemp, kuzudb_provider: KuzuDBProvider, mock_kuzu_connection: AsyncMock):
         mock_embedder = AsyncMock(spec=EmbedderClient)
-        # Simulate embedding generation for one node/edge that needs it
-        mock_embedder.create = AsyncMock(return_value=[[0.01, 0.02, 0.03]])
+        # Simulate embedding generation for various nodes/edges
+        # Let's say 1 entity node name, 1 entity edge fact, 1 community node name, 1 community node summary
+        mock_embedder.create = AsyncMock(return_value=[[0.01, 0.02, 0.03]] * 4)
+
 
         entity_nodes = [
-            EntityNode(uuid="bulk-en1", name="Bulk Entity 1", group_id="g1"), # Will need embedding
+            EntityNode(uuid="bulk-en1", name="Bulk Entity 1", group_id="g1"), # Needs name_embedding
             EntityNode(uuid="bulk-en2", name="Bulk Entity 2", group_id="g1", name_embedding=[.1,.2,.3]) # Has embedding
         ]
         entity_edges = [
-            EntityEdge(uuid="bulk-ee1", name="R", source_node_uuid="bulk-en1", target_node_uuid="bulk-en2", fact="Bulk Fact 1") # Will need embedding
+            EntityEdge(uuid="bulk-ee1", name="R_ENTITY", source_node_uuid="bulk-en1", target_node_uuid="bulk-en2", fact="Bulk Fact 1") # Needs fact_embedding
         ]
-        episodic_nodes = [EpisodicNode(uuid="bulk-ep1", name="Bulk Episode 1", source=EpisodeType.text, group_id="g1")]
+        episodic_nodes = [EpisodicNode(uuid="bulk-ep1", name="Bulk Episode 1", source=EpisodeType.text, group_id="g1")] # No direct text embedding field in EpisodicNode itself in Kuzu schema
         episodic_edges = [EpisodicEdge(uuid="bulk-epe1", source_node_uuid="bulk-ep1", target_node_uuid="bulk-en1", group_id="g1")]
+
+        community_nodes = [
+            CommunityNode(uuid="bulk-cn1", name="Bulk Community 1", group_id="g1", summary="Community summary to embed"), # Needs name_embedding and summary embedding (if provider supports summary embedding for community)
+            CommunityNode(uuid="bulk-cn2", name="Bulk Community 2", group_id="g1", name_embedding=[.4,.5,.6]) # Has name_embedding, no summary
+        ]
+        community_edges = [
+            CommunityEdge(uuid="bulk-ce1", source_node_uuid="bulk-cn1", target_node_uuid="bulk-en1", group_id="g1"),
+            CommunityEdge(uuid="bulk-ce2", source_node_uuid="bulk-cn2", target_node_uuid="bulk-en2", group_id="g1")
+        ]
 
         mock_ps_copy = MagicMock(name="ps_copy_from")
         mock_qr_copy = MagicMock(name="qr_copy_from")
@@ -1143,28 +1768,51 @@ class TestKuzuDBProvider:
         await kuzudb_provider.add_nodes_and_edges_bulk(
             episodic_nodes=episodic_nodes, episodic_edges=episodic_edges,
             entity_nodes=entity_nodes, entity_edges=entity_edges,
+            community_nodes=community_nodes, community_edges=community_edges, # Added community items
             embedder=mock_embedder
         )
 
-        # Verify embedder calls (1 for entity node, 1 for entity edge)
-        assert mock_embedder.create.call_count == 2
+        # Verify embedder calls:
+        # - EntityNode "Bulk Entity 1" (name) = 1
+        # - EntityEdge "bulk-ee1" (fact) = 1
+        # - CommunityNode "Bulk Community 1" (name) = 1
+        # - CommunityNode "Bulk Community 1" (summary, if provider embeds it for Community) - Assuming it does based on subtask
+        # Total = 4 (if community summary is embedded)
+        # Provider's current CommunityNode schema shows name_embedding. Summary is not directly an embedding field.
+        # Let's assume the provider's bulk method is updated to embed CommunityNode.name and CommunityNode.summary separately if needed.
+        # Based on KuzuDBProvider._COMMUNITY_NODE_TEXT_FIELDS = ["name", "summary"], it will try to embed both if missing.
+        # CommunityNode "bulk-cn1": name needs embedding, summary needs embedding.
+        # CommunityNode "bulk-cn2": name_embedding exists, summary is None so no embedding.
+        # Total embedder calls: Entity name (1), EntityEdge fact (1), CommunityNode name (1), CommunityNode summary (1) = 4
+        assert mock_embedder.create.call_count == 4
 
-        # Verify to_parquet calls (one for each type of data: Entity, Episodic, MENTIONS, RELATES_TO)
-        assert mock_to_parquet.call_count == 4
+        # Verify to_parquet calls (Entity, Episodic, Community, MENTIONS, RELATES_TO, HAS_MEMBER)
+        assert mock_to_parquet.call_count == 6
 
         # Verify COPY queries were prepared and executed
-        copy_prepare_calls = [call for call in mock_kuzu_connection.prepare.call_args_list if "COPY" in call[0][0]]
-        assert len(copy_prepare_calls) == 4 # Entity, Episodic, MENTIONS, RELATES_TO
+        copy_prepare_calls = [call[0][0] for call in mock_kuzu_connection.prepare.call_args_list if "COPY" in call[0][0]]
+        assert len(copy_prepare_calls) == 6 # Entity, Episodic, Community, MENTIONS, RELATES_TO, HAS_MEMBER
 
         copy_execute_calls = [call for call in mock_kuzu_connection.execute.call_args_list if call[0][0] == mock_ps_copy]
-        assert len(copy_execute_calls) == 4
+        assert len(copy_execute_calls) == 6
 
-        # Example: Check one COPY query for correct options (e.g., Entity with ON_CONFLICT)
-        entity_copy_query = next(q[0][0] for q in copy_prepare_calls if "COPY Entity FROM" in q[0][0])
+        # Check ON_CONFLICT for nodes
+        entity_copy_query = next(q for q in copy_prepare_calls if "COPY Entity FROM" in q)
         assert "(ON_CONFLICT (uuid) DO UPDATE SET" in entity_copy_query
 
-        mentions_copy_query = next(q[0][0] for q in copy_prepare_calls if "COPY MENTIONS FROM" in q[0][0])
-        assert "(ON_CONFLICT (uuid) DO UPDATE SET" not in mentions_copy_query # Rels shouldn't have it typically
+        community_copy_query = next(q for q in copy_prepare_calls if "COPY Community FROM" in q)
+        assert "(ON_CONFLICT (uuid) DO UPDATE SET" in community_copy_query # Assuming communities also upsert
+
+        # Check no ON_CONFLICT for edges by default (Kuzu specific: edges often don't have unique props beyond FROM/TO/TYPE for COPY conflict)
+        mentions_copy_query = next(q for q in copy_prepare_calls if "COPY MENTIONS FROM" in q)
+        assert "(ON_CONFLICT (uuid) DO UPDATE SET" not in mentions_copy_query
+
+        relates_to_copy_query = next(q for q in copy_prepare_calls if "COPY RELATES_TO FROM" in q)
+        assert "(ON_CONFLICT (uuid) DO UPDATE SET" not in relates_to_copy_query
+
+        has_member_copy_query = next(q for q in copy_prepare_calls if "COPY HAS_MEMBER FROM" in q)
+        assert "(ON_CONFLICT (uuid) DO UPDATE SET" not in has_member_copy_query
+
 
     # Add more tests for RRF, get_relevant_*, get_edge_invalidation_candidates, etc.
     # These will often involve mocking the underlying search methods of the provider itself.

@@ -791,10 +791,12 @@ class KuzuDBProvider(GraphDatabaseProvider):
     # --- Remaining Stubs ---
     async def add_nodes_and_edges_bulk(
         self,
-        episodic_nodes: List[EpisodicNode],
-        episodic_edges: List[EpisodicEdge],
-        entity_nodes: List[EntityNode],
-        entity_edges: List[EntityEdge],
+        episodic_nodes: List[EpisodicNode] = None, # type: ignore
+        episodic_edges: List[EpisodicEdge] = None, # type: ignore
+        entity_nodes: List[EntityNode] = None, # type: ignore
+        entity_edges: List[EntityEdge] = None, # type: ignore
+        community_nodes: List[CommunityNode] = None, # type: ignore
+        community_edges: List[CommunityEdge] = None, # type: ignore
         embedder: EmbedderClient
     ) -> None:
         """
@@ -810,7 +812,19 @@ class KuzuDBProvider(GraphDatabaseProvider):
         if not self.connection:
             raise ConnectionError("KuzuDB connection not established.")
 
-        logger.info(f"Starting KuzuDB bulk add: {len(episodic_nodes)} episodic, {len(entity_nodes)} entity nodes; {len(episodic_edges)} episodic, {len(entity_edges)} entity edges.")
+        # Handle default None values
+        episodic_nodes = episodic_nodes or []
+        episodic_edges = episodic_edges or []
+        entity_nodes = entity_nodes or []
+        entity_edges = entity_edges or []
+        community_nodes = community_nodes or []
+        community_edges = community_edges or []
+
+        logger.info(
+            f"Starting KuzuDB bulk add: "
+            f"{len(episodic_nodes)} episodic, {len(entity_nodes)} entity, {len(community_nodes)} community nodes; "
+            f"{len(episodic_edges)} episodic, {len(entity_edges)} entity, {len(community_edges)} community edges."
+        )
 
         # Required imports for COPY FROM approach
         try:
@@ -876,9 +890,22 @@ class KuzuDBProvider(GraphDatabaseProvider):
                 embedding_result = await embedder.create(input_data=[text_to_embed])
                 if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
                     edge.fact_embedding = embedding_result[0]
-        # Community Nodes (if they have embeddings, e.g. name_embedding)
-        # Assuming CommunityNode list is not passed but could be:
-        # for node in community_nodes: if node.name_embedding is None ...
+
+        # Community Nodes
+        # KuzuDBProvider._COMMUNITY_NODE_TEXT_FIELDS = ["name", "summary"] (conceptual)
+        for node in community_nodes:
+            if node.name_embedding is None:
+                text_to_embed = None
+                if hasattr(node, 'name') and node.name:
+                    text_to_embed = node.name.replace('\n', ' ')
+                elif hasattr(node, 'summary') and node.summary: # Fallback to summary if name is not present
+                    text_to_embed = node.summary.replace('\n', ' ')
+
+                if text_to_embed:
+                    embedding_result = await embedder.create(input_data=[text_to_embed])
+                    if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                        node.name_embedding = embedding_result[0]
+
         logger.info("Embedding generation complete.")
 
         # 2. Node Processing
@@ -910,13 +937,17 @@ class KuzuDBProvider(GraphDatabaseProvider):
             # Ensure embedding list format is compatible with Parquet/Kuzu if it's list-of-list
             await _copy_from_df_to_kuzu("Entity", entity_df, node_table=True)
 
-        # Community Nodes (assuming CommunityNode list might be added to signature later)
-        # For now, this part is illustrative if community_nodes were passed in.
-        # community_nodes: List[CommunityNode] = [] # Example
-        # if community_nodes:
-        #     community_data = [node.model_dump(exclude_none=False) for node in community_nodes]
-        #     community_df = pd.DataFrame(community_data)
-        #     await _copy_from_df_to_kuzu("Community", community_df, node_table=True)
+        # Community Nodes
+        if community_nodes:
+            community_data = []
+            for node in community_nodes:
+                d = node.model_dump(exclude_none=False)
+                # Ensure all schema fields for Community table are present
+                for key in ['uuid', 'name', 'group_id', 'created_at', 'summary', 'name_embedding']:
+                    d.setdefault(key, None)
+                community_data.append(d)
+            community_df = pd.DataFrame(community_data)
+            await _copy_from_df_to_kuzu("Community", community_df, node_table=True)
 
 
         # 3. Relationship Processing
@@ -958,12 +989,21 @@ class KuzuDBProvider(GraphDatabaseProvider):
             await _copy_from_df_to_kuzu("RELATES_TO", entity_edge_df, node_table=False)
 
         # Community Edges (HAS_MEMBER: Community -> Entity)
-        # community_edges: List[CommunityEdge] = [] # Example
-        # if community_edges:
-        #     community_edge_data = [edge.model_dump(exclude_none=False) for edge in community_edges]
-        #     # Add _from, _to mapping
-        #     # community_edge_df = pd.DataFrame(community_edge_data)
-        #     # await _copy_from_df_to_kuzu("HAS_MEMBER", community_edge_df, node_table=False)
+        if community_edges:
+            community_edge_data = []
+            for edge in community_edges:
+                d = edge.model_dump(exclude_none=False)
+                d["_from"] = edge.source_node_uuid # Community node UUID
+                d["_to"] = edge.target_node_uuid     # Entity node UUID
+                # Ensure all schema fields for HAS_MEMBER table are present
+                for key in ['uuid', 'group_id', 'created_at', '_from', '_to']:
+                    d.setdefault(key, None)
+                community_edge_data.append(d)
+            community_edge_df = pd.DataFrame(community_edge_data)
+            # Select only columns relevant to HAS_MEMBER schema
+            cols_for_has_member = ['_from', '_to', 'uuid', 'group_id', 'created_at']
+            community_edge_df = community_edge_df[cols_for_has_member]
+            await _copy_from_df_to_kuzu("HAS_MEMBER", community_edge_df, node_table=False)
 
         logger.info("KuzuDB bulk add_nodes_and_edges operation using COPY FROM completed.")
 

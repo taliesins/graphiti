@@ -47,6 +47,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_SAVE,
     EPISODIC_NODE_SAVE_BULK, # Import for bulk operations
     ENTITY_NODE_SAVE_BULK,   # Import for bulk operations
+    COMMUNITY_NODE_SAVE_BULK, # Import for bulk operations
 )
 from graphiti_core.models.edges.edge_db_queries import (
     EPISODIC_EDGE_SAVE,
@@ -54,6 +55,7 @@ from graphiti_core.models.edges.edge_db_queries import (
     COMMUNITY_EDGE_SAVE,
     EPISODIC_EDGE_SAVE_BULK, # Import for bulk operations
     ENTITY_EDGE_SAVE_BULK,   # Import for bulk operations
+    COMMUNITY_EDGE_SAVE_BULK, # Import for bulk operations
 )
 from neo4j import AsyncManagedTransaction # For type hinting in bulk tx function
 
@@ -1662,10 +1664,12 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
 
     async def add_nodes_and_edges_bulk(
         self,
-        episodic_nodes: List[EpisodicNode],
-        episodic_edges: List[EpisodicEdge],
-        entity_nodes: List[EntityNode],
-        entity_edges: List[EntityEdge],
+        episodic_nodes: List[EpisodicNode] = None, # type: ignore
+        episodic_edges: List[EpisodicEdge] = None, # type: ignore
+        entity_nodes: List[EntityNode] = None, # type: ignore
+        entity_edges: List[EntityEdge] = None, # type: ignore
+        community_nodes: List[CommunityNode] = None, # type: ignore
+        community_edges: List[CommunityEdge] = None, # type: ignore
         embedder: EmbedderClient
     ) -> None:
         """
@@ -1675,6 +1679,13 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
         if not self.driver:
             raise ConnectionError("Driver not initialized. Call connect() first.")
 
+        episodic_nodes = episodic_nodes or []
+        episodic_edges = episodic_edges or []
+        entity_nodes = entity_nodes or []
+        entity_edges = entity_edges or []
+        community_nodes = community_nodes or []
+        community_edges = community_edges or []
+
         # This internal transaction function mirrors the logic from the old
         # bulk_utils.add_nodes_and_edges_bulk_tx
         async def _add_nodes_and_edges_bulk_tx(
@@ -1683,6 +1694,8 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
             ep_edges: List[EpisodicEdge],
             en_nodes: List[EntityNode], # Embeddings are pre-generated for these
             en_edges: List[EntityEdge], # Embeddings are pre-generated for these
+            cm_nodes: List[CommunityNode], # Community Nodes
+            cm_edges: List[CommunityEdge], # Community Edges
             emb_client: EmbedderClient, # Passed for any potential deeper use, though primary embedding is outside
         ):
             # Prepare EpisodicNode data
@@ -1748,10 +1761,52 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
             if entity_edges_data:
                 await tx.run(ENTITY_EDGE_SAVE_BULK, entity_edges=entity_edges_data)
 
-            logger.info(f"Neo4j bulk transaction processed: {len(ep_nodes)} ep_nodes, {len(en_nodes)} en_nodes, {len(ep_edges)} ep_edges, {len(en_edges)} en_edges.")
+            # Community Nodes data preparation
+            community_nodes_data = []
+            for node in cm_nodes:
+                community_data: dict[str, Any] = {
+                    'uuid': node.uuid,
+                    'name': node.name,
+                    'group_id': node.group_id,
+                    'summary': node.summary,
+                    'name_embedding': node.name_embedding,
+                    'created_at': node.created_at,
+                }
+                community_data.update(node.attributes or {})
+                community_data['labels'] = list(set(node.labels + ['Community']))
+                community_nodes_data.append(community_data)
+
+            if community_nodes_data:
+                await tx.run(COMMUNITY_NODE_SAVE_BULK, nodes=community_nodes_data)
+
+            # Community Edges data preparation
+            community_edges_prepared_data = []
+            for edge in cm_edges:
+                edge_data: dict[str, Any] = {
+                    'uuid': edge.uuid,
+                    'source_node_uuid': edge.source_node_uuid,
+                    'target_node_uuid': edge.target_node_uuid,
+                    'group_id': edge.group_id,
+                    'created_at': edge.created_at,
+                }
+                edge_data.update(edge.attributes or {})
+                community_edges_prepared_data.append(edge_data)
+
+            if community_edges_prepared_data:
+                await tx.run(COMMUNITY_EDGE_SAVE_BULK, community_edges=community_edges_prepared_data)
+
+
+            logger.info(
+                f"Neo4j bulk transaction processed: "
+                f"{len(ep_nodes)} ep_nodes, {len(en_nodes)} en_nodes, {len(cm_nodes)} cm_nodes, "
+                f"{len(ep_edges)} ep_edges, {len(en_edges)} en_edges, {len(cm_edges)} cm_edges."
+            )
 
         # Perform embedding generation before starting the database transaction.
-        logger.info(f"Neo4jProvider: Starting bulk add. Generating embeddings first...")
+        logger.info(
+            f"Neo4jProvider: Starting bulk add. Processing {len(entity_nodes)} entity, "
+            f"{len(community_nodes)} community nodes and {len(entity_edges)} entity edges for embeddings."
+        )
         for node in entity_nodes:
             if node.name_embedding is None and hasattr(node, 'name') and node.name:
                 text_to_embed = node.name.replace('\n', ' ')
@@ -1766,6 +1821,23 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
                 embedding_result = await embedder.create(input_data=[text_to_embed])
                 if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
                     edge.fact_embedding = embedding_result[0]
+
+        # Community Nodes Embeddings
+        for node in community_nodes:
+            if node.name_embedding is None:
+                texts_to_embed = []
+                if hasattr(node, 'name') and node.name:
+                    texts_to_embed.append(node.name.replace('\n', ' '))
+                if hasattr(node, 'summary') and node.summary: # Neo4j provider combines name and summary for embedding
+                    texts_to_embed.append(node.summary.replace('\n', ' '))
+
+                if texts_to_embed:
+                    final_text_to_embed = " ".join(texts_to_embed).strip()
+                    if final_text_to_embed:
+                        embedding_result = await embedder.create(input_data=[final_text_to_embed])
+                        if embedding_result and isinstance(embedding_result, list) and len(embedding_result) > 0 and isinstance(embedding_result[0], list):
+                            node.name_embedding = embedding_result[0]
+
         logger.info("Embeddings generated. Proceeding with Neo4j transaction.")
 
         async with self.get_session() as session:
@@ -1775,6 +1847,8 @@ def _group_id_filter_clause(alias: str, group_ids: Optional[List[str]]) -> str:
                 episodic_edges,
                 entity_nodes,
                 entity_edges,
+                community_nodes, # Pass community_nodes
+                community_edges, # Pass community_edges
                 embedder, # Embedder is passed but embeddings are now pre-generated
             )
         logger.info("Neo4j bulk add_nodes_and_edges operation completed.")
